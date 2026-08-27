@@ -452,16 +452,3 @@ export class BookingsController {
   exports:     [BookingsService],
 })
 export class BookingsModule {}
-
-
-// ── Mock confirm endpoint (payment skipped) ──────────────────────────────────
-// Remove this and use real /bookings + /bookings/verify when Razorpay is ready.
-import { IsUUID, IsInt, IsString, Min } from "class-validator";
-import { Type } from "class-transformer";
-
-class MockConfirmDto {
-  @IsUUID()   rideId:      string;
-  @IsInt() @Min(1) @Type(() => Number) quantity: number;
-  @IsString() paymentMethod: string;
-  @IsString() customerEmail: string;
-}
