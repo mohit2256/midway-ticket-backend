@@ -1,0 +1,467 @@
+import { EmailProcessor } from "./email.processor";
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOOKINGS MODULE
+// Flow: Customer selects ride → CreateBooking → Razorpay order created
+//       → Frontend redirects to payment → Webhook confirms → Ticket issued
+// ═══════════════════════════════════════════════════════════════════════════════
+
+import {
+  Injectable, NotFoundException, BadRequestException, Logger,
+} from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, DataSource } from "typeorm";
+import { InjectDataSource } from "@nestjs/typeorm";
+import { InjectQueue } from "@nestjs/bullmq";
+import { Queue } from "bullmq";
+import { ConfigService } from "@nestjs/config";
+import Razorpay from "razorpay";
+import * as crypto from "crypto";
+import { v4 as uuidv4 } from "uuid";
+import {
+  IsUUID, IsInt, Min, Max, IsEnum, IsEmail, IsString, IsOptional,
+} from "class-validator";
+import { Type } from "class-transformer";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import {
+  Controller, Post, Body, Param, Headers, RawBodyRequest, Req,
+  UseGuards, HttpCode, HttpStatus, Get,
+} from "@nestjs/common";
+import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
+import { Request } from "express";
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { BullModule } from "@nestjs/bullmq";
+
+import {
+  TicketEntity, PaymentEntity, RideEntity, FairEntity,
+  UserEntity, TicketStatus, PaymentStatus, PaymentMethod, NotificationType,
+} from "../entities";
+import { JwtAuthGuard, CurrentUser, Roles, RolesGuard } from "../../common/guards/auth.guards";
+import { UserRole } from "../entities";
+import { NotificationsService } from "../notifications/notifications.module";
+import { NotificationsModule } from "../notifications/notifications.module";
+
+// ── DTOs ──────────────────────────────────────────────────────────────────────
+
+export class CreateBookingDto {
+  @ApiProperty() @IsUUID()  rideId:  string;
+  @ApiProperty() @IsInt() @Min(1) @Max(10) @Type(() => Number) quantity: number;
+  // Only meaningful once PAYMENTS_ENABLED=true. Frontend can omit this
+  // entirely in launch mode; validation below allows it to be absent.
+  @ApiPropertyOptional() @IsOptional() @IsEnum(PaymentMethod) paymentMethod?: PaymentMethod;
+  @ApiPropertyOptional() @IsEmail()  @IsString() customerEmail?: string;
+}
+
+export class VerifyPaymentDto {
+  @ApiProperty() @IsString() razorpayOrderId:    string;
+  @ApiProperty() @IsString() razorpayPaymentId:  string;
+  @ApiProperty() @IsString() razorpaySignature:  string;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+@Injectable()
+export class BookingsService {
+  private readonly logger   = new Logger(BookingsService.name);
+  private readonly razorpay: Razorpay | null;
+  private readonly paymentsEnabled: boolean;
+
+  constructor(
+    @InjectRepository(TicketEntity)  private tickets:  Repository<TicketEntity>,
+    @InjectRepository(PaymentEntity) private payments: Repository<PaymentEntity>,
+    @InjectRepository(RideEntity)    private rides:    Repository<RideEntity>,
+    @InjectRepository(FairEntity)    private fairs:    Repository<FairEntity>,
+    @InjectRepository(UserEntity)    private users:    Repository<UserEntity>,
+    @InjectDataSource()              private db:       DataSource,
+    @InjectQueue("email")            private emailQ:   Queue,
+    private readonly config: ConfigService,
+    private readonly notifications: NotificationsService,
+  ) {
+    this.paymentsEnabled = this.config.get("app.paymentsEnabled", false);
+    // Don't even construct the Razorpay client when the feature is off —
+    // avoids requiring real/test keys to exist for the launch build at all.
+    this.razorpay = this.paymentsEnabled
+      ? new Razorpay({
+          key_id:     config.get("app.razorpay.keyId",     "rzp_test_key"),
+          key_secret: config.get("app.razorpay.keySecret", "rzp_test_secret"),
+        })
+      : null;
+  }
+
+  /**
+   * Create a booking.
+   *
+   * Launch mode (PAYMENTS_ENABLED=false, the default): validates capacity
+   * under lock and issues the ticket immediately — no charge, no Razorpay
+   * order, single request/response round trip. This is the whole "book +
+   * get QR by email" MVP flow.
+   *
+   * Payments mode (PAYMENTS_ENABLED=true, future): unchanged two-step flow —
+   * this method only creates the Razorpay order + a PENDING payment row;
+   * verifyAndIssueTicket() does the actual capacity check + ticket issuance
+   * once the frontend confirms payment.
+   */
+  async createBooking(userId: string, dto: CreateBookingDto) {
+    const ride = await this.rides.findOne({
+      where: { id: dto.rideId },
+      relations: ["fair"],
+    });
+    if (!ride) throw new NotFoundException("Ride not found");
+    if (ride.status !== "Active") throw new BadRequestException("This ride is not currently available");
+
+    const totalAmount = ride.pricePerPerson * dto.quantity;
+
+    if (!this.paymentsEnabled) {
+      return this.issueFreeTicket(userId, ride, dto.quantity, totalAmount);
+    }
+
+    // ── Payments-enabled path (dormant until PAYMENTS_ENABLED=true) ────────
+    const order = await this.razorpay!.orders.create({
+      amount:   totalAmount * 100,
+      currency: "INR",
+      receipt:  `mt_${Date.now()}`,
+    }).catch((err) => {
+      this.logger.error("Razorpay order creation failed", err);
+      throw new BadRequestException("Payment gateway error. Please try again.");
+    });
+
+    // Create pending payment record — ride + quantity are stored now so the
+    // capacity lock in verifyAndIssueTicket() knows exactly what to check.
+    const payment = this.payments.create({
+      razorpayOrderId: order.id,
+      amount:          totalAmount,
+      currency:        "INR",
+      status:          PaymentStatus.PENDING,
+      method:          dto.paymentMethod,
+      quantity:        dto.quantity,
+      customer:        { id: userId } as UserEntity,
+      ride:            { id: ride.id } as RideEntity,
+    });
+    await this.payments.save(payment);
+
+    return {
+      orderId:     order.id,
+      amount:      totalAmount,
+      currency:    "INR",
+      paymentId:   payment.id,
+      rideDetails: {
+        name:    ride.name,
+        fairName: ride.fair?.name,
+        quantity: dto.quantity,
+        pricePerPerson: ride.pricePerPerson,
+      },
+      razorpayKeyId: this.config.get("app.razorpay.keyId"),
+    };
+  }
+
+  /**
+   * Launch-mode booking: same capacity lock as the paid flow (see
+   * verifyAndIssueTicket for why pessimistic_write is used here too — the
+   * double-booking risk is identical whether or not money changes hands),
+   * but issues the ticket in one step. The PaymentEntity row is still
+   * written (status PAID, method FREE, real amount recorded) purely so
+   * historical bookings look uniform once payments are switched on later —
+   * no ticket-issuing code path needs to change when that day comes.
+   */
+  private async issueFreeTicket(
+    userId: string,
+    ride: RideEntity,
+    quantity: number,
+    totalAmount: number,
+  ) {
+    return this.db.transaction("READ COMMITTED", async (em) => {
+      const lockedRide = await em.getRepository(RideEntity)
+        .createQueryBuilder("ride")
+        .setLock("pessimistic_write")
+        .where("ride.id = :id", { id: ride.id })
+        .getOne();
+
+      if (!lockedRide) throw new NotFoundException("Ride not found");
+
+      const bookedCount = await em.getRepository(TicketEntity).count({
+        where: { ride: { id: lockedRide.id }, ticketStatus: TicketStatus.VALID },
+      });
+
+      if (bookedCount + quantity > lockedRide.capacity) {
+        await this.notifications.enqueue({
+          type:    NotificationType.RIDE_SOLD_OUT,
+          fairId:  lockedRide.fair?.id,
+          payload: { rideId: lockedRide.id, rideName: lockedRide.name },
+        });
+        throw new BadRequestException("This ride just sold out.");
+      }
+
+      const payment = em.getRepository(PaymentEntity).create({
+        amount:   totalAmount,
+        currency: "INR",
+        status:   PaymentStatus.PAID,
+        method:   PaymentMethod.FREE,
+        quantity,
+        customer: { id: userId } as UserEntity,
+        ride:     { id: lockedRide.id } as RideEntity,
+      });
+      await em.save(payment);
+
+      const ticket = await this.issueTicket(em, userId, payment, quantity, lockedRide);
+
+      await this.emailQ.add("send-ticket", {
+        customerId: userId,
+        ticketId:   ticket.id,
+        displayId:  ticket.displayId,
+      }).catch(() => {/* email failure should not fail the booking */});
+
+      await this.notifications.enqueue({
+        type:            NotificationType.TICKET_ISSUED,
+        recipientUserId: userId,
+        payload: { ticketId: ticket.id, displayId: ticket.displayId },
+      });
+
+      return { ticket, paymentId: payment.id };
+    });
+  }
+
+  /** Step 2: Verify Razorpay signature and issue the ticket (payments-mode only) */
+  async verifyAndIssueTicket(userId: string, dto: VerifyPaymentDto) {
+    if (!this.paymentsEnabled) {
+      throw new BadRequestException("Payments are not enabled on this deployment yet.");
+    }
+    const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = dto;
+
+    // Signature verification
+    const expectedSig = crypto
+      .createHmac("sha256", this.config.get("app.razorpay.keySecret", ""))
+      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+      .digest("hex");
+
+    if (expectedSig !== razorpaySignature) {
+      throw new BadRequestException("Payment verification failed — invalid signature");
+    }
+
+    // NOTE on isolation: Postgres default is READ COMMITTED. We do NOT rely on
+    // raising the transaction isolation level here — instead we take a
+    // pessimistic row lock (`SELECT ... FOR UPDATE`) on the specific ride row.
+    // This serializes concurrent bookings for the *same ride* without paying
+    // the cost (and retry/serialization-failure handling) of SERIALIZABLE
+    // across the whole transaction. This is the standard, low-risk pattern
+    // for "don't oversell N seats" problems.
+    return this.db.transaction("READ COMMITTED", async (em) => {
+      const payment = await em.getRepository(PaymentEntity).findOne({
+        where: { razorpayOrderId, customer: { id: userId } },
+        relations: ["ride"],
+      });
+      if (!payment) throw new NotFoundException("Payment record not found");
+      if (payment.status === PaymentStatus.PAID) {
+        throw new BadRequestException("Payment already processed");
+      }
+      if (!payment.ride) {
+        throw new BadRequestException("Payment is missing ride reference");
+      }
+
+      // ── Capacity lock: block every other transaction trying to book the
+      // same ride until this one commits/rolls back. Prevents the classic
+      // double-booking race where two requests both read "2 seats left"
+      // and both insert a ticket.
+      const ride = await em.getRepository(RideEntity)
+        .createQueryBuilder("ride")
+        .setLock("pessimistic_write")
+        .where("ride.id = :id", { id: payment.ride.id })
+        .getOne();
+
+      if (!ride) throw new NotFoundException("Ride not found");
+
+      const bookedCount = await em.getRepository(TicketEntity).count({
+        where: { ride: { id: ride.id }, ticketStatus: TicketStatus.VALID },
+      });
+
+      if (bookedCount + payment.quantity > ride.capacity) {
+        // Refund/void path left for the payments module — for now we fail
+        // fast so no ticket is issued beyond capacity.
+        payment.status = PaymentStatus.FAILED;
+        await em.save(payment);
+        await this.notifications.enqueue({
+          type:    NotificationType.RIDE_SOLD_OUT,
+          fairId:  ride.fair?.id,
+          payload: { rideId: ride.id, rideName: ride.name },
+        });
+        throw new BadRequestException(
+          "This ride just sold out. Your payment will be refunded.",
+        );
+      }
+
+      // Mark payment as paid
+      payment.status             = PaymentStatus.PAID;
+      payment.razorpayPaymentId  = razorpayPaymentId;
+      payment.razorpaySignature  = razorpaySignature;
+      await em.save(payment);
+
+      const ticket = await this.issueTicket(em, userId, payment, payment.quantity, ride);
+
+      // Queue confirmation email (non-blocking)
+      await this.emailQ.add("send-ticket", {
+        customerId: userId,
+        ticketId:   ticket.id,
+        displayId:  ticket.displayId,
+      }).catch(() => {/* email failure should not fail the booking */});
+
+      // In-app + future push/SMS notification — also non-blocking, also
+      // outside this DB transaction's concern. Eventual consistency: the
+      // customer sees "Ticket Issued" pop up a moment after the response.
+      await this.notifications.enqueue({
+        type:             NotificationType.TICKET_ISSUED,
+        recipientUserId:  userId,
+        payload: {
+          ticketId:  ticket.id,
+          displayId: ticket.displayId,
+        },
+      });
+
+      return { ticket, paymentId: payment.id };
+    });
+  }
+
+  /**
+   * Razorpay webhook handler.
+   * Handles payment.captured and payment.failed events.
+   * Webhook is the source of truth for payment status — not just the frontend callback.
+   */
+  async handleWebhook(
+    rawBody: Buffer,
+    signature: string,
+  ) {
+    if (!this.paymentsEnabled) {
+      throw new BadRequestException("Payments are not enabled on this deployment yet.");
+    }
+    const secret = this.config.get("app.razorpay.webhookSecret", "");
+
+    // Verify webhook signature
+    const expectedSig = crypto
+      .createHmac("sha256", secret)
+      .update(rawBody)
+      .digest("hex");
+
+    if (expectedSig !== signature) {
+      throw new BadRequestException("Invalid webhook signature");
+    }
+
+    const event = JSON.parse(rawBody.toString());
+    this.logger.log(`Razorpay webhook: ${event.event}`);
+
+    if (event.event === "payment.captured") {
+      const p = event.payload.payment.entity;
+      const payment = await this.payments.findOne({
+        where: { razorpayOrderId: p.order_id },
+      });
+      if (payment && payment.status !== PaymentStatus.PAID) {
+        payment.status            = PaymentStatus.PAID;
+        payment.razorpayPaymentId = p.id;
+        payment.gatewayResponse   = p;
+        await this.payments.save(payment);
+      }
+    }
+
+    if (event.event === "payment.failed") {
+      const p = event.payload.payment.entity;
+      const payment = await this.payments.findOne({
+        where: { razorpayOrderId: p.order_id },
+      });
+      if (payment) {
+        payment.status          = PaymentStatus.FAILED;
+        payment.gatewayResponse = p;
+        await this.payments.save(payment);
+      }
+    }
+
+    return { received: true };
+  }
+
+  private async issueTicket(
+    em: any,
+    userId: string,
+    payment: PaymentEntity,
+    quantity: number,
+    ride: RideEntity,
+  ) {
+    // Generate unique display ID and cryptographic QR token
+    const displayId = `MT${Date.now().toString().slice(-5)}`;
+    const qrToken   = uuidv4(); // opaque — no user data in QR
+
+    const ticket = em.getRepository(TicketEntity).create({
+      displayId,
+      qrToken,
+      quantity,
+      pricePerPerson: ride.pricePerPerson,
+      totalAmount:   payment.amount,
+      paymentMethod: payment.method,
+      paymentStatus: PaymentStatus.PAID,
+      ticketStatus:  TicketStatus.VALID,
+      eventDate:     new Date().toISOString().split("T")[0],
+      customer:      { id: userId } as UserEntity,
+      ride:          { id: ride.id } as RideEntity,
+      fair:          { id: ride.fair?.id } as FairEntity,
+      payment,
+    });
+    return em.getRepository(TicketEntity).save(ticket);
+  }
+}
+
+// ── Controller ────────────────────────────────────────────────────────────────
+
+@ApiTags("bookings")
+@Controller({ path: "bookings", version: "1" })
+export class BookingsController {
+  constructor(private readonly svc: BookingsService) {}
+
+  @Post()
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: "Book a ride. Issues ticket directly while PAYMENTS_ENABLED=false; returns a Razorpay order once payments are switched on." })
+  create(@Body() dto: CreateBookingDto, @CurrentUser("sub") userId: string) {
+    return this.svc.createBooking(userId, dto);
+  }
+
+  @Post("verify")
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "[Payments mode only] Verify Razorpay payment and issue ticket" })
+  verify(@Body() dto: VerifyPaymentDto, @CurrentUser("sub") userId: string) {
+    return this.svc.verifyAndIssueTicket(userId, dto);
+  }
+
+  @Post("webhook")
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "[Payments mode only] Razorpay webhook endpoint (no auth)" })
+  webhook(
+    @Req() req: RawBodyRequest<Request>,
+    @Headers("x-razorpay-signature") sig: string,
+  ) {
+    return this.svc.handleWebhook(req.rawBody!, sig);
+  }
+}
+
+// ── Module ────────────────────────────────────────────────────────────────────
+
+@Module({
+  imports: [
+    TypeOrmModule.forFeature([TicketEntity, PaymentEntity, RideEntity, FairEntity, UserEntity]),
+    BullModule.registerQueue({ name: "email" }),
+    NotificationsModule,
+  ],
+  controllers: [BookingsController],
+  providers:   [BookingsService, EmailProcessor],
+  exports:     [BookingsService],
+})
+export class BookingsModule {}
+
+
+// ── Mock confirm endpoint (payment skipped) ──────────────────────────────────
+// Remove this and use real /bookings + /bookings/verify when Razorpay is ready.
+import { IsUUID, IsInt, IsString, Min } from "class-validator";
+import { Type } from "class-transformer";
+
+class MockConfirmDto {
+  @IsUUID()   rideId:      string;
+  @IsInt() @Min(1) @Type(() => Number) quantity: number;
+  @IsString() paymentMethod: string;
+  @IsString() customerEmail: string;
+}

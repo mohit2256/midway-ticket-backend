@@ -1,0 +1,111 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Backend CI/CD — MidwayTicket API
+#
+# Pipeline stages: build → migrate → deploy.
+#
+# DESIGNED FOR PAINLESS PAYMENT-GATEWAY ONBOARDING LATER:
+# Every credential this pipeline needs (DB, Redis, Razorpay, future AWS
+# Secrets Manager, etc.) is read from GitHub Actions "secrets" — never
+# hardcoded here. Turning on payments later means:
+#   1. Add RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET
+#      as repo secrets (Settings → Secrets and variables → Actions).
+#   2. Set PAYMENTS_ENABLED=true as a Railway environment variable.
+#   3. Push. No change to this YAML file is required.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/midway-ticket-api/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/midway-ticket-api/**"
+
+defaults:
+  run:
+    working-directory: backend/midway-ticket-api
+
+jobs:
+  # ── Build & lint — runs on every push and PR ────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/midway-ticket-api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # Tests are intentionally not blocking the pipeline yet — no test
+      # suite exists at this stage of the project. Uncomment once tests
+      # (see project TODOs) are written:
+      # - name: Test
+      #   run: npm test
+
+  # ── Migrate — runs only on push to main, after a successful build ──────────
+  # Applies pending TypeORM migrations against the production database
+  # BEFORE the new app version is deployed, so every replica boots against
+  # an already-correct schema (see typeorm-cli.datasource.ts / app.module.ts
+  # for why `synchronize` is always false).
+  migrate:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/midway-ticket-api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run database migrations
+        run: npm run migration:run
+        env:
+          POSTGRES_HOST:     ${{ secrets.PROD_POSTGRES_HOST }}
+          POSTGRES_PORT:     ${{ secrets.PROD_POSTGRES_PORT }}
+          POSTGRES_DB:       ${{ secrets.PROD_POSTGRES_DB }}
+          POSTGRES_USER:     ${{ secrets.PROD_POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
+          POSTGRES_SSL:      "true"
+
+  # ── Deploy — Railway picks up the new image/build ───────────────────────────
+  # Railway's own GitHub integration can auto-deploy on push to main with no
+  # action needed here. This explicit step exists so deploy is provably
+  # gated on "migrations already succeeded" rather than racing them — Railway
+  # would otherwise deploy the instant it sees the push, independent of the
+  # migrate job above.
+  deploy:
+    needs: migrate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        run: railway up --service midway-ticket-api
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
