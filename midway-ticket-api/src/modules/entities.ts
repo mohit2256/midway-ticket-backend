@@ -5,7 +5,7 @@
 
 import {
   Entity, PrimaryGeneratedColumn, Column, CreateDateColumn,
-  UpdateDateColumn, ManyToOne, OneToMany, JoinColumn, Index, Unique,
+  UpdateDateColumn, ManyToOne, OneToMany, JoinColumn, Index, Unique, Relation,
 } from "typeorm";
 
 // ── USER / ROLES ──────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ export class OperatorEntity {
   fairs: FairEntity[];
 
   @OneToMany(() => StaffEntity, (s) => s.operator)
-  staff: StaffEntity[];
+  staff: Relation<StaffEntity[]>;
 
   @CreateDateColumn()
   createdAt: Date;
@@ -208,7 +208,7 @@ export class RideEntity {
   fair: FairEntity;
 
   @OneToMany(() => StaffEntity, (s) => s.assignedRide)
-  assignedStaff: StaffEntity[];
+  assignedStaff: Relation<StaffEntity[]>;
 
   @OneToMany(() => TicketEntity, (t) => t.ride)
   tickets: TicketEntity[];
@@ -272,7 +272,7 @@ export class TicketEntity {
 
   @ManyToOne(() => StaffEntity, { nullable: true })
   @JoinColumn()
-  redeemedByStaff: StaffEntity;
+  redeemedByStaff: Relation<StaffEntity>;
 
   @Column({ nullable: true })
   redeemedAtGate: string;
@@ -292,7 +292,7 @@ export class TicketEntity {
 
   @ManyToOne(() => PaymentEntity, { nullable: true })
   @JoinColumn()
-  payment: PaymentEntity;
+  payment: Relation<PaymentEntity>;
 
   @CreateDateColumn()
   createdAt: Date;
