@@ -1,14 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// PARTITION MAINTENANCE — keeps `tickets` monthly partitions ahead of demand.
+// PARTITION MAINTENANCE
 //
-// The initial migration creates a rolling partition window. This service extends
-// that window automatically so future event dates always have a dedicated
-// monthly partition.
+// Keeps `tickets` monthly partitions ahead of demand.
+//
+// The initial migration creates the base `tickets` table and its initial
+// partition window. This service extends the window automatically.
 //
 // Uses plain PostgreSQL SQL instead of pg_partman so it works with managed
 // PostgreSQL providers such as Railway.
 //
-// The job is registered through BullMQ and also runs once on application boot.
+// IMPORTANT:
+// This service MUST NOT crash the entire API if the database schema has not
+// been created yet. Migrations are responsible for creating the `tickets`
+// table. Until that table exists, maintenance simply skips the current run.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {
@@ -42,8 +46,11 @@ export class PartitionMaintenanceService implements OnModuleInit {
   ) {}
 
   /**
-   * Register the monthly maintenance job and run maintenance once immediately
-   * when the application starts.
+   * Register the monthly maintenance job.
+   *
+   * We also attempt one immediate maintenance run on boot, but the attempt
+   * is intentionally safe: if migrations have not created `tickets` yet,
+   * the API continues starting normally instead of crashing.
    */
   async onModuleInit(): Promise<void> {
     await this.queue.add(
@@ -61,22 +68,53 @@ export class PartitionMaintenanceService implements OnModuleInit {
   }
 
   /**
+   * Check whether the tickets table exists before attempting any partition
+   * operation.
+   *
+   * This protects application startup on a fresh database or during a
+   * deployment where migrations have not completed yet.
+   */
+  private async ticketsTableExists(): Promise<boolean> {
+    const result = await this.db.query(`
+      SELECT to_regclass('public.tickets') IS NOT NULL AS "exists"
+    `);
+
+    return result[0]?.exists === true;
+  }
+
+  /**
    * Creates the monthly partition 24 months ahead.
    *
-   * IMPORTANT:
-   * Do not pass PostgreSQL parameters ($1, $2...) inside a DO $$ block here.
-   * PostgreSQL does not bind TypeORM parameters in this context the way a
-   * normal parameterized query does. The numeric constant is controlled by
-   * application code and inserted into the SQL after validation.
+   * PostgreSQL parameters ($1, $2...) are intentionally NOT used inside the
+   * DO $$ block. The value is a validated application constant and is safely
+   * inserted into the SQL text.
    */
   async extendPartitions(): Promise<void> {
     this.logger.log("Running tickets partition maintenance...");
 
+    // ── Safety guard ────────────────────────────────────────────────────────
+    const ticketsExists = await this.ticketsTableExists();
+
+    if (!ticketsExists) {
+      this.logger.warn(
+        'Skipping partition maintenance because the "tickets" table does not exist yet. ' +
+          "Run the database migrations first.",
+      );
+
+      return;
+    }
+
     const monthsAhead = MONTHS_AHEAD_TO_MAINTAIN;
 
-    // Defensive validation because this value becomes part of the SQL text.
-    if (!Number.isInteger(monthsAhead) || monthsAhead < 0 || monthsAhead > 120) {
-      throw new Error("Invalid MONTHS_AHEAD_TO_MAINTAIN value");
+    // Defensive validation because this value becomes part of SQL text.
+    if (
+      !Number.isInteger(monthsAhead) ||
+      monthsAhead < 0 ||
+      monthsAhead > 120
+    ) {
+      throw new Error(
+        "Invalid MONTHS_AHEAD_TO_MAINTAIN value",
+      );
     }
 
     await this.db.query(`
@@ -91,7 +129,8 @@ export class PartitionMaintenanceService implements OnModuleInit {
           now() + interval '${monthsAhead} months'
         )::date;
 
-        part_name := 'tickets_' || to_char(target_month, 'YYYY_MM');
+        part_name :=
+          'tickets_' || to_char(target_month, 'YYYY_MM');
 
         SELECT EXISTS (
           SELECT 1
@@ -102,7 +141,7 @@ export class PartitionMaintenanceService implements OnModuleInit {
 
         IF NOT exists_check THEN
           EXECUTE format(
-            'CREATE TABLE %I PARTITION OF tickets FOR VALUES FROM (%L) TO (%L)',
+            'CREATE TABLE %I PARTITION OF "tickets" FOR VALUES FROM (%L) TO (%L)',
             part_name,
             target_month,
             target_month + interval '1 month'
