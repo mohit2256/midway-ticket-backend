@@ -74,13 +74,18 @@ export class PartitionMaintenanceService implements OnModuleInit {
    * This protects application startup on a fresh database or during a
    * deployment where migrations have not completed yet.
    */
-  private async ticketsTableExists(): Promise<boolean> {
-    const result = await this.db.query(`
-      SELECT to_regclass('public.tickets') IS NOT NULL AS "exists"
-    `);
-
-    return result[0]?.exists === true;
-  }
+ private async ticketsTableExists(): Promise<boolean> {
+  const result = await this.db.query(`
+    SELECT EXISTS (
+      SELECT 1 FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = 'tickets'
+        AND n.nspname = 'public'
+        AND c.relkind = 'p'
+    ) AS "exists"
+  `);
+  return result[0]?.exists === true;
+}
 
   /**
    * Creates the monthly partition 24 months ahead.
