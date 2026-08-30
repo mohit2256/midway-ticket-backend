@@ -17,15 +17,30 @@ async function bootstrap() {
   app.use(helmet({ crossOriginEmbedderPolicy: false }));
   app.use(compression());
 
-  // CORS — allow frontend origin from env
-  const frontendUrl = config.get<string>("FRONTEND_URL", "http://localhost:3000");
+  // CORS — a misconfigured/missing FRONTEND_URL here silently breaks EVERY
+  // API call from the deployed frontend (fetch fails, promises reject, and
+  // any caller without a .catch() just hangs — this is what caused fairs
+  // to spin forever and login to fail with no clear reason). Belt-and-braces:
+  // - trim the env var (a stray trailing space/slash breaks exact-match CORS)
+  // - always allow the known production Vercel domain explicitly, so this
+  //   doesn't depend entirely on Railway's env var being set correctly
+  // - allow any *.vercel.app preview deployment too, since Vercel generates
+  //   a new preview URL per branch/PR
+  const configuredFrontendUrl = config.get<string>("FRONTEND_URL", "").trim().replace(/\/$/, "");
+  const knownOrigins = [
+    configuredFrontendUrl,
+    "https://midway-ticket.vercel.app",
+    "http://localhost:3000",
+  ].filter(Boolean);
+
   app.enableCors({
-    origin: [
-      frontendUrl,
-      "http://localhost:3000",
-      // Add your Vercel production URL here after deploy:
-      // "https://your-app.vercel.app",
-    ],
+    origin: (origin, callback) => {
+      // No origin header = server-to-server / curl / health checks — allow.
+      if (!origin) return callback(null, true);
+      const isKnown   = knownOrigins.includes(origin);
+      const isVercel  = /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin);
+      callback(null, isKnown || isVercel);
+    },
     credentials: true,
     methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allowedHeaders: ["Content-Type","Authorization"],
