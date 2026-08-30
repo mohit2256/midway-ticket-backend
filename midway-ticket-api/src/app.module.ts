@@ -39,10 +39,20 @@ import { appConfig, databaseConfig } from "./config/app.config";
         autoLoadEntities: true,
         // Horizontal scaling requires this to be false everywhere, not just
         // in prod: with 2+ replicas, every instance boots at once and would
-        // otherwise race to ALTER the same tables. Schema changes now go
+        // otherwise race to ALTER the same tables. Schema changes normally go
         // through src/migrations (see typeorm-cli.datasource.ts) and are run
         // once — in CI/CD, before new instances start — not on every boot.
-        synchronize:      false,
+        //
+        // TEMPORARY BOOTSTRAP ESCAPE HATCH: if migrations have never been run
+        // against this database, the tables (fairs, tickets, etc.) simply
+        // don't exist yet — every query 500s, which is exactly what was
+        // happening here. Setting DB_SYNC=true as a Railway env var makes
+        // TypeORM create every table from the current entities on next boot.
+        // Safe to do once on an empty database. Once confirmed working,
+        // REMOVE the DB_SYNC var (or set it to "false") so this goes back to
+        // the safe, migration-only path — leaving it "true" long-term is what
+        // the comment above warns against (multi-replica races).
+        synchronize:      cfg.get("DB_SYNC") === "true",
         logging:          cfg.get("NODE_ENV") === "development",
       }),
     }),
