@@ -195,9 +195,17 @@ export class BookingsService {
 
       if (!lockedRide) throw new NotFoundException("Ride not found");
 
-      const bookedCount = await em.getRepository(TicketEntity).count({
-        where: { ride: { id: lockedRide.id }, ticketStatus: TicketStatus.VALID },
-      });
+      // Count SEATS booked, not ticket rows. A single ticket row can cover
+      // multiple people (quantity > 1) — .count() would undercount capacity
+      // usage whenever any booking has quantity > 1, silently allowing
+      // overselling. SUM(quantity) is the actual number of seats taken.
+      const { total } = await em.getRepository(TicketEntity)
+        .createQueryBuilder("t")
+        .select("COALESCE(SUM(t.quantity), 0)", "total")
+        .where("t.rideId = :rideId", { rideId: lockedRide.id })
+        .andWhere("t.ticketStatus = :status", { status: TicketStatus.VALID })
+        .getRawOne();
+      const bookedCount = Number(total);
 
       if (bookedCount + quantity > lockedRide.capacity) {
         await this.notifications.enqueue({
@@ -286,9 +294,15 @@ export class BookingsService {
 
       if (!ride) throw new NotFoundException("Ride not found");
 
-      const bookedCount = await em.getRepository(TicketEntity).count({
-        where: { ride: { id: ride.id }, ticketStatus: TicketStatus.VALID },
-      });
+      // Same seats-not-rows fix as issueFreeTicket() above — kept identical
+      // so free and future paid bookings enforce capacity the same way.
+      const { total } = await em.getRepository(TicketEntity)
+        .createQueryBuilder("t")
+        .select("COALESCE(SUM(t.quantity), 0)", "total")
+        .where("t.rideId = :rideId", { rideId: ride.id })
+        .andWhere("t.ticketStatus = :status", { status: TicketStatus.VALID })
+        .getRawOne();
+      const bookedCount = Number(total);
 
       if (bookedCount + payment.quantity > ride.capacity) {
         // Refund/void path left for the payments module — for now we fail
