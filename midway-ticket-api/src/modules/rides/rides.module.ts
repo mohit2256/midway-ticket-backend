@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { Injectable, NotFoundException, ForbiddenException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { IsString, IsNumber, IsInt, IsEnum, IsOptional } from "class-validator";
@@ -9,7 +9,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { RideEntity, FairEntity, RideCategory, RideStatus } from "../entities";
-import { JwtAuthGuard, RolesGuard, Roles } from "../../common/guards/auth.guards";
+import { JwtAuthGuard, RolesGuard, Roles, CurrentUser } from "../../common/guards/auth.guards";
 import { UserRole } from "../entities";
 import { LruCache } from "../../common/cache/lru-cache";
 
@@ -33,16 +33,11 @@ class UpdateRideDto {
 
 @Injectable()
 export class RidesService {
-  // App-level LRU, in front of Postgres, for single-ride lookups. Bounded to
-  // 200 rides — comfortably covers every ride across every fair a single API
-  // process would realistically have "hot" at once (a fair rarely runs more
-  // than a few dozen rides). See lru-cache.ts for why LRU fits rides
-  // specifically (recency-bursty scan traffic).
   private readonly rideCache = new LruCache<string, RideEntity>(200);
 
   constructor(
-    @InjectRepository(RideEntity) private rides: Repository<RideEntity>,
-    @InjectRepository(FairEntity) private fairs: Repository<FairEntity>,
+    @InjectRepository(RideEntity)  private rides: Repository<RideEntity>,
+    @InjectRepository(FairEntity)  private fairs: Repository<FairEntity>,
   ) {}
 
   async findByFair(fairId: string) {
@@ -66,13 +61,27 @@ export class RidesService {
     return this.rides.save(this.rides.create({ ...dto, fair }));
   }
 
-  async update(id: string, dto: UpdateRideDto) {
-    const r = await this.rides.findOne({ where: { id } });
-    if (!r) throw new NotFoundException("Ride not found");
-    Object.assign(r, dto);
-    const saved = await this.rides.save(r);
-    // Invalidate — a stale cached ride (old price/status) is worse than a
-    // cache miss. The next findOne() repopulates it from Postgres.
+  /**
+   * Update a ride — only the operator that owns the ride's fair may do this.
+   * Ownership chain: ride → fair → operator → owner (userId from JWT).
+   * We load the full chain here so we can reject cross-operator tampering
+   * before touching the row, rather than relying on a WHERE-clause silently
+   * returning 0 rows (which would give a confusing 404 instead of 403).
+   */
+  async update(id: string, dto: UpdateRideDto, userId: string) {
+    const ride = await this.rides.findOne({
+      where:     { id },
+      relations: ["fair", "fair.operator", "fair.operator.owner"],
+    });
+    if (!ride) throw new NotFoundException("Ride not found");
+
+    if (ride.fair?.operator?.owner?.id !== userId) {
+      throw new ForbiddenException("You do not own this ride");
+    }
+
+    Object.assign(ride, dto);
+    const saved = await this.rides.save(ride);
+    // Invalidate cache — stale price/status is worse than a miss.
     this.rideCache.delete(id);
     return saved;
   }
@@ -104,9 +113,13 @@ export class RidesController {
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
-  @ApiOperation({ summary: "Update ride (operator)" })
-  update(@Param("id") id: string, @Body() dto: UpdateRideDto) {
-    return this.svc.update(id, dto);
+  @ApiOperation({ summary: "Update ride (operator — must own the ride's fair)" })
+  update(
+    @Param("id") id: string,
+    @Body() dto: UpdateRideDto,
+    @CurrentUser("sub") userId: string,
+  ) {
+    return this.svc.update(id, dto, userId);
   }
 }
 
