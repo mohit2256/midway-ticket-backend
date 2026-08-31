@@ -55,6 +55,17 @@ export class StaffService {
     @InjectRepository(ScanLogEntity)  private scanLogs:  Repository<ScanLogEntity>,
   ) {}
 
+  /**
+   * Resolve the OperatorEntity that belongs to this authenticated user.
+   * Throws ForbiddenException if the user has no operator profile — prevents
+   * any operator-scoped action from falling through with a wrong/stale id.
+   */
+  async resolveOperator(userId: string): Promise<string> {
+    const operator = await this.operators.findOne({ where: { owner: { id: userId } } });
+    if (!operator) throw new ForbiddenException("No operator account found for this user");
+    return operator.id;
+  }
+
   async findAll(operatorId: string) {
     return this.staff.find({
       where:     { operator: { id: operatorId } },
@@ -73,7 +84,6 @@ export class StaffService {
   }
 
   async getScanHistory(staffId: string, operatorId: string) {
-    // Verify ownership first
     const member = await this.staff.findOne({
       where: { id: staffId, operator: { id: operatorId } },
     });
@@ -88,7 +98,6 @@ export class StaffService {
   }
 
   async create(dto: CreateStaffDto, operatorId: string) {
-    // Check email not already taken
     const existingUser = await this.users.findOne({ where: { email: dto.email } });
     if (existingUser) throw new ConflictException("Email already in use");
 
@@ -102,7 +111,6 @@ export class StaffService {
     if (!fair)     throw new NotFoundException("Fair not found");
     if (!operator) throw new NotFoundException("Operator not found");
 
-    // Create the user account for this staff member
     const user = this.users.create({
       name:         dto.name,
       email:        dto.email,
@@ -112,7 +120,6 @@ export class StaffService {
     });
     await this.users.save(user);
 
-    // Check if this user already has a staff record for this fair
     const existing = await this.staff.findOne({
       where: { user: { id: user.id }, fair: { id: fair.id } },
     });
@@ -156,7 +163,6 @@ export class StaffService {
     return this.staff.save(member);
   }
 
-  /** Get the authenticated staff member's own assignment (for scanner UI) */
   async getMyAssignment(userId: string) {
     const member = await this.staff.findOne({
       where:     { user: { id: userId }, isActive: true },
@@ -168,10 +174,10 @@ export class StaffService {
       gate:         member.gate,
       scansToday:   member.scansToday,
       assignedRide: {
-        id:           member.assignedRide.id,
-        name:         member.assignedRide.name,
-        emoji:        member.assignedRide.emoji,
-        coverGradient:member.assignedRide.coverGradient,
+        id:            member.assignedRide.id,
+        name:          member.assignedRide.name,
+        emoji:         member.assignedRide.emoji,
+        coverGradient: member.assignedRide.coverGradient,
       },
       assignedFair: {
         id:   member.fair.id,
@@ -196,40 +202,48 @@ export class StaffController {
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @UseGuards(RolesGuard)
   @ApiOperation({ summary: "List all staff for operator" })
-  findAll(@CurrentUser("sub") userId: string) {
-    // TODO: resolve operatorId from userId
-    return this.svc.findAll("op-001");
+  async findAll(@CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.findAll(operatorId);
   }
 
   @Get(":id")
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @UseGuards(RolesGuard)
-  findOne(@Param("id") id: string) {
-    return this.svc.findOne(id, "op-001");
+  async findOne(@Param("id") id: string, @CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.findOne(id, operatorId);
   }
 
   @Get(":id/scans")
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @UseGuards(RolesGuard)
   @ApiOperation({ summary: "Get scan history for a staff member" })
-  getScanHistory(@Param("id") id: string) {
-    return this.svc.getScanHistory(id, "op-001");
+  async getScanHistory(@Param("id") id: string, @CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.getScanHistory(id, operatorId);
   }
 
   @Post()
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @UseGuards(RolesGuard)
   @ApiOperation({ summary: "Create staff account with ride assignment" })
-  create(@Body() dto: CreateStaffDto, @CurrentUser("sub") _userId: string) {
-    return this.svc.create(dto, "op-001");
+  async create(@Body() dto: CreateStaffDto, @CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.create(dto, operatorId);
   }
 
   @Patch(":id")
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @UseGuards(RolesGuard)
   @ApiOperation({ summary: "Update staff assignment or status" })
-  update(@Param("id") id: string, @Body() dto: UpdateStaffDto) {
-    return this.svc.update(id, dto, "op-001");
+  async update(
+    @Param("id") id: string,
+    @Body() dto: UpdateStaffDto,
+    @CurrentUser("sub") userId: string,
+  ) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.update(id, dto, operatorId);
   }
 
   @Delete(":id")
@@ -237,8 +251,9 @@ export class StaffController {
   @UseGuards(RolesGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: "Deactivate a staff account" })
-  deactivate(@Param("id") id: string) {
-    return this.svc.deactivate(id, "op-001");
+  async deactivate(@Param("id") id: string, @CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.deactivate(id, operatorId);
   }
 
   // ── Staff-self endpoint ────────────────────────────────────────────────────
