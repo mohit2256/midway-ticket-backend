@@ -111,6 +111,50 @@ export class AnalyticsService {
       .andWhere("r.status = 'Active'")
       .getCount();
 
+    // Both of these were previously missing from this response entirely,
+    // even though the frontend's OperatorDashboardData type requires them —
+    // that mismatch is what crashed the dashboard page (data!.recentTickets
+    // was always undefined, data!.weeklyData likewise). Reusing
+    // getWeeklyData() keeps this endpoint and GET /analytics/weekly
+    // returning identical weekly numbers instead of two divergent queries.
+    const weeklyData = await this.getWeeklyData(operatorId);
+
+    const recentTicketRows = await this.tickets
+      .createQueryBuilder("t")
+      .leftJoinAndSelect("t.customer", "customer")
+      .leftJoinAndSelect("t.ride", "ride")
+      .leftJoin("t.fair", "f").leftJoin("f.operator", "o")
+      .where("o.id = :operatorId", { operatorId })
+      .orderBy("t.createdAt", "DESC")
+      .limit(10)
+      .getMany();
+
+    // Flat DTO shape matching the frontend's Ticket type exactly (same
+    // hand-mapping convention already used for scan responses in
+    // tickets.module.ts) — never hand raw entities with nested
+    // customer/ride objects back to a consumer expecting flat fields.
+    const recentTickets = recentTicketRows.map((t) => ({
+      id:            t.id,
+      fairId:        t.fair?.id ?? "",
+      fairName:      t.fair?.name ?? "",
+      rideId:        t.ride?.id ?? "",
+      rideName:      t.ride?.name ?? "",
+      rideEmoji:     t.ride?.emoji ?? "",
+      rideCoverGradient: t.ride?.coverGradient ?? "",
+      customerId:    t.customer?.id ?? "",
+      customerName:  t.customer?.name ?? "",
+      customerEmail: t.customer?.email ?? "",
+      quantity:      t.quantity,
+      pricePerPerson: Number(t.pricePerPerson),
+      totalAmount:   Number(t.totalAmount),
+      paymentMethod: t.paymentMethod,
+      paymentStatus: t.paymentStatus,
+      ticketStatus:  t.ticketStatus,
+      qrData:        t.qrToken,
+      bookedAt:      t.createdAt,
+      eventDate:     t.eventDate,
+    }));
+
     const revenueChange = yStats?.revenue
       ? ((todayStats.revenue - yStats.revenue) / yStats.revenue) * 100
       : 0;
@@ -128,6 +172,7 @@ export class AnalyticsService {
       visitorsChange:     Math.round(ticketChange * 10)   / 10,
       activeRides,
       hourlyData:      this.formatHourly(hourly),
+      weeklyData,
       ridePerformance: ridePerf.map((r) => ({
         rideId:        r.rideid,
         rideName:      r.ridename,
@@ -136,6 +181,7 @@ export class AnalyticsService {
         revenue:       Number(r.revenue),
         changePercent: 0,
       })),
+      recentTickets,
     };
 
     await this.cache.set(cacheKey, result, this.CACHE_TTL);
