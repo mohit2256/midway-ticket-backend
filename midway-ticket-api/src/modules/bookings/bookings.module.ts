@@ -189,6 +189,7 @@ export class BookingsService {
     return this.db.transaction("READ COMMITTED", async (em) => {
       const lockedRide = await em.getRepository(RideEntity)
         .createQueryBuilder("ride")
+        .leftJoinAndSelect("ride.fair", "fair")
         .setLock("pessimistic_write")
         .where("ride.id = :id", { id: ride.id })
         .getOne();
@@ -288,6 +289,7 @@ export class BookingsService {
       // and both insert a ticket.
       const ride = await em.getRepository(RideEntity)
         .createQueryBuilder("ride")
+        .leftJoinAndSelect("ride.fair", "fair")
         .setLock("pessimistic_write")
         .where("ride.id = :id", { id: payment.ride.id })
         .getOne();
@@ -416,6 +418,19 @@ export class BookingsService {
     const displayId = `MT${Date.now().toString().slice(-5)}`;
     const qrToken   = uuidv4(); // opaque — no user data in QR
 
+    // eventDate MUST be the fair's actual event date, never "today" (booking
+    // day and event day are different whenever someone books in advance).
+    // This also feeds the partitioned tickets table's partition key (see
+    // migrations/PartitionTicketsByEventDate) — a wrong date here silently
+    // files the ticket under the wrong month's partition. `ride.fair` is
+    // loaded via leftJoinAndSelect at both call sites specifically so this
+    // is always available; if it's ever missing, fail loudly rather than
+    // quietly falling back to today's date (the bug being fixed).
+    if (!ride.fair?.startDate) {
+      throw new BadRequestException("This ride's fair has no event date set — cannot issue ticket.");
+    }
+    const eventDate = ride.fair.startDate;
+
     const ticket = em.getRepository(TicketEntity).create({
       displayId,
       qrToken,
@@ -425,10 +440,10 @@ export class BookingsService {
       paymentMethod: payment.method,
       paymentStatus: PaymentStatus.PAID,
       ticketStatus:  TicketStatus.VALID,
-      eventDate:     new Date().toISOString().split("T")[0],
+      eventDate,
       customer:      { id: userId } as UserEntity,
       ride:          { id: ride.id } as RideEntity,
-      fair:          { id: ride.fair?.id } as FairEntity,
+      fair:          { id: ride.fair.id } as FairEntity,
       payment,
     });
     return em.getRepository(TicketEntity).save(ticket);
