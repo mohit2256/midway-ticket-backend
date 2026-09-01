@@ -4,7 +4,9 @@ import { ForbiddenException, NotFoundException } from "@nestjs/common";
 import { RidesService } from "./rides.module";
 import { RideEntity, FairEntity } from "../entities";
 
-const mockRepo = () => ({ find: jest.fn(), findOne: jest.fn(), create: jest.fn(), save: jest.fn() });
+const mockRepo = () => ({
+  find: jest.fn(), findOne: jest.fn(), create: jest.fn(), save: jest.fn(),
+});
 
 describe("RidesService", () => {
   let svc:       RidesService;
@@ -18,6 +20,7 @@ describe("RidesService", () => {
         { provide: getRepositoryToken(FairEntity), useFactory: mockRepo },
       ],
     }).compile();
+
     svc       = mod.get(RidesService);
     ridesRepo = mod.get(getRepositoryToken(RideEntity));
   });
@@ -30,17 +33,17 @@ describe("RidesService", () => {
       fair: { operator: { owner: { id: ownerId } } },
     } as unknown as RideEntity;
 
-    it("throws NotFoundException when ride does not exist", async () => {
+    it("throws NotFoundException when the ride does not exist", async () => {
       ridesRepo.findOne.mockResolvedValue(null);
       await expect(svc.update("ride-x", {}, ownerId)).rejects.toBeInstanceOf(NotFoundException);
     });
 
-    it("throws ForbiddenException when caller does not own the ride", async () => {
+    it("throws ForbiddenException when caller does not own the ride's fair", async () => {
       ridesRepo.findOne.mockResolvedValue(rideStub);
       await expect(svc.update("ride-1", {}, otherId)).rejects.toBeInstanceOf(ForbiddenException);
     });
 
-    it("allows update when caller owns the ride", async () => {
+    it("applies the update when caller owns the ride", async () => {
       const updated = { ...rideStub, pricePerPerson: 150 };
       ridesRepo.findOne.mockResolvedValue({ ...rideStub });
       ridesRepo.save.mockResolvedValue(updated);
@@ -51,7 +54,6 @@ describe("RidesService", () => {
     it("evicts the LRU cache entry on successful update", async () => {
       ridesRepo.findOne.mockResolvedValue({ ...rideStub });
       ridesRepo.save.mockResolvedValue({ ...rideStub });
-      // Pre-warm cache
       (svc as any).rideCache.set("ride-1", rideStub);
       expect((svc as any).rideCache.get("ride-1")).toBeDefined();
       await svc.update("ride-1", {}, ownerId);
