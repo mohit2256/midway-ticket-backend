@@ -155,14 +155,30 @@ export class AuthService {
     return this.issueTokens(user);
   }
 
-  private issueTokens(user: UserEntity) {
+  /**
+   * Issue JWT tokens and return a complete auth payload.
+   * operatorId is resolved here so that the frontend never needs a follow-up
+   * fairs lookup (which fails for brand-new operators who have 0 fairs yet).
+   */
+  private async issueTokens(user: UserEntity) {
     const payload: JwtPayload = { sub: user.id, email: user.email, role: user.role };
+
+    let operatorId = "";
+    if (
+      user.role === UserRole.OPERATOR_OWNER ||
+      user.role === UserRole.OPERATOR_MANAGER
+    ) {
+      const op = await this.operators.findOne({ where: { owner: { id: user.id } } });
+      operatorId = op?.id ?? "";
+    }
+
     return {
-      accessToken:  this.jwtService.sign(payload),
-      userId: user.id,
-      email:  user.email,
-      name:   user.name,
-      role:   user.role,
+      accessToken: this.jwtService.sign(payload),
+      userId:      user.id,
+      email:       user.email,
+      name:        user.name,
+      role:        user.role,
+      operatorId,             // empty string for customers/staff — never null
     };
   }
 }
