@@ -17,15 +17,6 @@ async function bootstrap() {
   app.use(helmet({ crossOriginEmbedderPolicy: false }));
   app.use(compression());
 
-  // CORS — a misconfigured/missing FRONTEND_URL here silently breaks EVERY
-  // API call from the deployed frontend (fetch fails, promises reject, and
-  // any caller without a .catch() just hangs — this is what caused fairs
-  // to spin forever and login to fail with no clear reason). Belt-and-braces:
-  // - trim the env var (a stray trailing space/slash breaks exact-match CORS)
-  // - always allow the known production Vercel domain explicitly, so this
-  //   doesn't depend entirely on Railway's env var being set correctly
-  // - allow any *.vercel.app preview deployment too, since Vercel generates
-  //   a new preview URL per branch/PR
   const configuredFrontendUrl = config.get<string>("FRONTEND_URL", "").trim().replace(/\/$/, "");
   const knownOrigins = [
     configuredFrontendUrl,
@@ -35,15 +26,18 @@ async function bootstrap() {
 
   app.enableCors({
     origin: (origin, callback) => {
-      // No origin header = server-to-server / curl / health checks — allow.
       if (!origin) return callback(null, true);
-      const isKnown   = knownOrigins.includes(origin);
-      const isVercel  = /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin);
+      const isKnown  = knownOrigins.includes(origin);
+      const isVercel = /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin);
       callback(null, isKnown || isVercel);
     },
     credentials: true,
-    methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-    allowedHeaders: ["Content-Type","Authorization"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    // idempotency-key is used by POST /bookings to prevent duplicate tickets
+    // on double-click or network retry. Must be listed here or the browser's
+    // CORS preflight rejects it before our controller even sees the request.
+    allowedHeaders: ["Content-Type", "Authorization", "idempotency-key"],
+    exposedHeaders: ["idempotency-key"],
   });
 
   app.setGlobalPrefix(prefix);
