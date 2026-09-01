@@ -15,7 +15,7 @@ const mockRepo = () => ({
 });
 
 describe("StaffService", () => {
-  let svc: StaffService;
+  let svc:           StaffService;
   let operatorsRepo: ReturnType<typeof mockRepo>;
   let staffRepo:     ReturnType<typeof mockRepo>;
 
@@ -38,19 +38,19 @@ describe("StaffService", () => {
   });
 
   describe("resolveOperator", () => {
-    it("returns operator id for a valid user", async () => {
+    it("returns the operator id for a valid user", async () => {
       operatorsRepo.findOne.mockResolvedValue({ id: "op-abc" });
       await expect(svc.resolveOperator("user-1")).resolves.toBe("op-abc");
     });
 
-    it("throws ForbiddenException when user has no operator profile", async () => {
+    it("throws ForbiddenException when the user has no operator profile", async () => {
       operatorsRepo.findOne.mockResolvedValue(null);
       await expect(svc.resolveOperator("user-x")).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
 
   describe("findAll", () => {
-    it("scopes query to the given operatorId", async () => {
+    it("scopes the query to the given operatorId", async () => {
       staffRepo.find.mockResolvedValue([]);
       await svc.findAll("op-abc");
       expect(staffRepo.find).toHaveBeenCalledWith(
@@ -60,7 +60,7 @@ describe("StaffService", () => {
   });
 
   describe("findOne", () => {
-    it("throws NotFoundException when staff not found or belongs to another operator", async () => {
+    it("throws NotFoundException when staff belongs to another operator", async () => {
       staffRepo.findOne.mockResolvedValue(null);
       await expect(svc.findOne("staff-1", "op-abc")).rejects.toBeInstanceOf(NotFoundException);
     });
@@ -74,11 +74,11 @@ describe("StaffService", () => {
 
   describe("deactivate", () => {
     it("prevents deactivating staff owned by another operator", async () => {
-      staffRepo.findOne.mockResolvedValue(null); // not found for this operatorId
+      staffRepo.findOne.mockResolvedValue(null);
       await expect(svc.deactivate("staff-1", "op-other")).rejects.toBeInstanceOf(NotFoundException);
     });
 
-    it("sets isActive=false when operator owns the staff", async () => {
+    it("sets isActive=false when the operator owns the staff member", async () => {
       const member = { id: "staff-1", isActive: true };
       staffRepo.findOne.mockResolvedValue(member);
       staffRepo.save.mockResolvedValue({ ...member, isActive: false });
