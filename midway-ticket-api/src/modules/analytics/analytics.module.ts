@@ -19,7 +19,16 @@ import { UserRole } from "../entities";
 
 @Injectable()
 export class AnalyticsService {
-  private readonly CACHE_TTL = 60_000;
+  // "v2" here is deliberate: the dashboard response shape changed (added
+  // weeklyData + recentTickets, previously missing entirely — see below).
+  // Reusing the old cache key would let a stale, pre-fix cached response
+  // (missing those fields) keep being served from Redis after this exact
+  // fix was deployed, since redeploying application code does NOT clear
+  // Redis — only this key's own TTL expiry does, and that expiry's actual
+  // duration depends on the installed cache-manager/Keyv adapter's TTL unit
+  // (ms vs seconds), which is easy to get wrong across version upgrades.
+  // Bumping the key guarantees a clean cache regardless of that ambiguity.
+  private readonly CACHE_TTL = 60_000; // intended: 60 seconds
 
   constructor(
     @InjectRepository(TicketEntity)   private tickets:   Repository<TicketEntity>,
@@ -41,7 +50,7 @@ export class AnalyticsService {
   }
 
   async getDashboard(operatorId: string) {
-    const cacheKey = `analytics:dashboard:${operatorId}`;
+    const cacheKey = `analytics:dashboard:v2:${operatorId}`;
     const cached   = await this.cache.get(cacheKey);
     if (cached) return cached;
 
