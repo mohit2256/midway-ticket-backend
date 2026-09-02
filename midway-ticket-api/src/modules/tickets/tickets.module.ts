@@ -133,6 +133,44 @@ export class TicketsService {
     }
 
     // ── Step 2: Database atomic transaction ──────────────────────────────────
+    // FIX: `pessimistic_write_or_fail` (SELECT ... FOR UPDATE NOWAIT) throws
+    // immediately if the row is already locked — e.g. two staff scanning the
+    // same ticket within the same instant, or a client-side retry firing
+    // while the first attempt is still committing. That raw Postgres error
+    // (55P03 "lock_not_available") was previously uncaught here, bubbling up
+    // as an unhandled 500 to the scanner app instead of a clear result. The
+    // lock window for one scan is a single row update — sub-millisecond in
+    // practice — so a couple of short retries resolve almost every real
+    // contention case correctly (into VALID / ALREADY_USED / etc.) instead
+    // of surfacing a raw error to gate staff.
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.redeemInTransaction(staffId, qrToken, rideId, gate);
+      } catch (err: any) {
+        const isLockConflict = err?.code === "55P03"; // lock_not_available
+        if (!isLockConflict || attempt === maxAttempts) {
+          if (isLockConflict) {
+            throw new ConflictException(
+              "This ticket is being scanned by another device right now. Please try again in a moment.",
+            );
+          }
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 75 * attempt));
+      }
+    }
+    // Unreachable — the loop above always returns or throws — but keeps
+    // TypeScript's control-flow analysis happy about the return type.
+    throw new ConflictException("Could not process this scan. Please try again.");
+  }
+
+  private async redeemInTransaction(
+    staffId: string,
+    qrToken: string,
+    rideId:  string,
+    gate:    string,
+  ): Promise<RedeemResult> {
     return this.db.transaction(async (em) => {
       // SELECT … FOR UPDATE SKIP LOCKED prevents race conditions on high-traffic fairs
       const ticket = await em
