@@ -113,21 +113,95 @@ export class BookingsService {
    * ticket issuance once the frontend confirms payment.
    */
   async createBooking(userId: string, dto: CreateBookingDto, idempotencyKey?: string) {
+    if (!idempotencyKey) {
+      return this._createBookingInternal(userId, dto);
+    }
+
     // ── Idempotency check ──────────────────────────────────────────────────
-    if (idempotencyKey) {
-      const cacheKey = `idempotency:booking:${userId}:${idempotencyKey}`;
-      const cached   = await this.cache.get(cacheKey);
-      if (cached) {
+    // FIX: the previous implementation did `cache.get()` then, after the
+    // booking finished, `cache.set()` — a classic check-then-act race. Two
+    // near-simultaneous requests with the same key (e.g. a double-tap on
+    // "Pay Now", or a frontend retry firing before the first response lands)
+    // could both see "not cached yet" and both create a ticket.
+    //
+    // Fix: atomically CLAIM the key first (Redis `SET key val NX`), before
+    // doing any booking work. Only the request that wins the claim creates
+    // the ticket; anyone else with the same key waits briefly and receives
+    // the winner's result instead of creating a duplicate.
+    const cacheKey = `idempotency:booking:${userId}:${idempotencyKey}`;
+
+    const claimed = await this.tryClaimIdempotencyKey(cacheKey);
+
+    if (!claimed) {
+      // Either a previous attempt already finished (cached final result), or
+      // one is in flight right now (short-lived "processing" placeholder).
+      const cached: any = await this.cache.get(cacheKey);
+      if (cached && cached.__status !== "processing") {
         this.logger.log(`Idempotent replay for key=${idempotencyKey} user=${userId}`);
         return cached;
       }
-      // Store the result after booking completes (see bottom of method)
+      const result = await this.awaitIdempotentResult(cacheKey);
+      if (result) return result;
+      throw new ConflictException(
+        "This booking is already being processed. Please wait a moment before retrying.",
+      );
+    }
+
+    try {
       const result = await this._createBookingInternal(userId, dto);
       await this.cache.set(cacheKey, result, this.IDEMPOTENCY_TTL_MS);
       return result;
+    } catch (err) {
+      // Don't leave the "processing" placeholder stuck behind on failure —
+      // that would permanently block retries using the same key. Wrapped in
+      // try/catch (not `.catch()` chaining) so this cleanup can never mask
+      // the original booking error, even if `del` itself is unavailable.
+      try {
+        await this.cache.del(cacheKey);
+      } catch {
+        /* best-effort cleanup only — the 30s claim TTL is the real safety net */
+      }
+      throw err;
     }
+  }
 
-    return this._createBookingInternal(userId, dto);
+  /**
+   * Atomically claim an idempotency key so only one concurrent request
+   * proceeds to create the booking. Uses the underlying Redis client's
+   * `SET key val NX PX <ms>` (available via cache-manager-redis-yet), which
+   * is a single atomic operation — unlike a separate get+set.
+   *
+   * Falls back to a best-effort (non-atomic) check if the raw client isn't
+   * reachable for any reason (e.g. a different cache store in tests), rather
+   * than throwing and breaking booking entirely — this keeps the fallback
+   * behaviour identical to what shipped before this fix.
+   */
+  private async tryClaimIdempotencyKey(cacheKey: string): Promise<boolean> {
+    try {
+      const client = (this.cache as any)?.store?.client;
+      if (client?.set) {
+        const res = await client.set(
+          cacheKey,
+          JSON.stringify({ __status: "processing" }),
+          { NX: true, PX: 30_000 }, // short claim window — just long enough to finish one booking
+        );
+        return res === "OK";
+      }
+    } catch (err) {
+      this.logger.warn(`Idempotency claim via raw client failed, falling back: ${err}`);
+    }
+    const existing = await this.cache.get(cacheKey);
+    return !existing;
+  }
+
+  /** Poll briefly for the in-flight request (that won the claim) to finish. */
+  private async awaitIdempotentResult(cacheKey: string, attempts = 10, delayMs = 300) {
+    for (let i = 0; i < attempts; i++) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      const cached: any = await this.cache.get(cacheKey);
+      if (cached && cached.__status !== "processing") return cached;
+    }
+    return null;
   }
 
   private async _createBookingInternal(userId: string, dto: CreateBookingDto) {
@@ -449,11 +523,6 @@ export class BookingsService {
     return em.getRepository(TicketEntity).save(ticket);
   }
 }
-
-// ── Controller ────────────────────────────────────────────────────────────────
-
-@ApiTags("bookings")
-@Controller({ path: "bookings", version: "1" })
 
 // ── Controller ────────────────────────────────────────────────────────────────
 
