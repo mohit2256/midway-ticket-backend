@@ -70,6 +70,20 @@ export class FairsService {
     return fair;
   }
 
+  /**
+   * FIX: `findByOperator` filters by `operator.id` (the OperatorEntity's own
+   * primary key), which is NOT the same as the logged-in user's id. The
+   * controller was previously passing the raw JWT `sub` (a userId) straight
+   * through here, so the query never matched and every operator's "My
+   * Fairs" list came back empty. Resolve userId → operatorId first, same
+   * pattern already used in AnalyticsService/StaffService.
+   */
+  async resolveOperator(userId: string): Promise<string> {
+    const operator = await this.operators.findOne({ where: { owner: { id: userId } } });
+    if (!operator) throw new ForbiddenException("No operator account found for this user");
+    return operator.id;
+  }
+
   async findByOperator(operatorId: string) {
     return this.fairs.find({
       where: { operator: { id: operatorId } },
@@ -117,8 +131,9 @@ export class FairsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
   @ApiOperation({ summary: "List operator's own fairs" })
-  myFairs(@CurrentUser("sub") userId: string) {
-    return this.svc.findByOperator(userId);
+  async myFairs(@CurrentUser("sub") userId: string) {
+    const operatorId = await this.svc.resolveOperator(userId);
+    return this.svc.findByOperator(operatorId);
   }
 
   @Get(":id")
