@@ -55,9 +55,25 @@ export class RidesService {
     return r;
   }
 
-  async create(fairId: string, dto: CreateRideDto) {
-    const fair = await this.fairs.findOne({ where: { id: fairId } });
+  /**
+   * FIX: this previously never checked who owns `fairId` — only the role
+   * guard (@Roles OPERATOR_OWNER/MANAGER) was enforced, which just proves
+   * the caller is *some* operator, not that they own *this* fair. Any
+   * logged-in operator could add rides to a competitor's fair by passing
+   * its id. Same ownership chain check as update() below, applied before
+   * the fair is used.
+   */
+  async create(fairId: string, dto: CreateRideDto, userId: string) {
+    const fair = await this.fairs.findOne({
+      where:     { id: fairId },
+      relations: ["operator", "operator.owner"],
+    });
     if (!fair) throw new NotFoundException("Fair not found");
+
+    if (fair.operator?.owner?.id !== userId) {
+      throw new ForbiddenException("You do not own this fair");
+    }
+
     return this.rides.save(this.rides.create({ ...dto, fair }));
   }
 
@@ -104,9 +120,13 @@ export class RidesController {
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
-  @ApiOperation({ summary: "Add ride to fair (operator)" })
-  create(@Param("fairId") fairId: string, @Body() dto: CreateRideDto) {
-    return this.svc.create(fairId, dto);
+  @ApiOperation({ summary: "Add ride to fair (operator — must own the fair)" })
+  create(
+    @Param("fairId") fairId: string,
+    @Body() dto: CreateRideDto,
+    @CurrentUser("sub") userId: string,
+  ) {
+    return this.svc.create(fairId, dto, userId);
   }
 
   @Patch(":id")
