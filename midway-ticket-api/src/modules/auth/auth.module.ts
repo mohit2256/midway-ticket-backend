@@ -164,12 +164,14 @@ export class AuthService {
     const payload: JwtPayload = { sub: user.id, email: user.email, role: user.role };
 
     let operatorId = "";
+    let operatorName = "";
     if (
       user.role === UserRole.OPERATOR_OWNER ||
       user.role === UserRole.OPERATOR_MANAGER
     ) {
       const op = await this.operators.findOne({ where: { owner: { id: user.id } } });
-      operatorId = op?.id ?? "";
+      operatorId   = op?.id ?? "";
+      operatorName = op?.name ?? "";
     }
 
     return {
@@ -179,6 +181,7 @@ export class AuthService {
       name:        user.name,
       role:        user.role,
       operatorId,             // empty string for customers/staff — never null
+      operatorName,           // the OperatorEntity's business name, not the owner's personal name
     };
   }
 }
