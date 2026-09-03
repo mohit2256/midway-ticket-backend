@@ -49,7 +49,7 @@ export class CreateBookingDto {
   // Only meaningful once PAYMENTS_ENABLED=true. Frontend can omit this
   // entirely in launch mode; validation below allows it to be absent.
   @ApiPropertyOptional() @IsOptional() @IsEnum(PaymentMethod) paymentMethod?: PaymentMethod;
-  @ApiPropertyOptional() @IsEmail()  @IsString() customerEmail?: string;
+  @ApiPropertyOptional() @IsOptional() @IsEmail() customerEmail?: string;
 }
 
 export class VerifyPaymentDto {
