@@ -66,6 +66,48 @@ export interface RedeemResult {
   redeemedAtGate?: string;
 }
 
+/**
+ * FIX: `TicketEntity` only ever exposed nested relation objects
+ * (`ticket.ride`, `ticket.fair`, `ticket.customer`) — but the frontend's
+ * `Ticket` type expects flat fields (`fairName`, `rideName`, `rideEmoji`,
+ * `customerName`, etc). Every real API response silently had those fields
+ * `undefined`, which broke the "just booked" ticket card shown right after
+ * checkout and any direct property access on the My Tickets / ticket detail
+ * pages. This is the single source of truth for that shape — every endpoint
+ * that returns a customer-facing ticket routes through this, so the shape
+ * can't drift between "my tickets", "ticket detail", and "just booked".
+ * Callers must load the `ride`, `fair`, and `customer` relations (and
+ * `redeemedByStaff`/`redeemedByStaff.user` when redemption info matters) —
+ * this function only reads what's already been joined, it doesn't query.
+ */
+export function toTicketDto(ticket: TicketEntity) {
+  return {
+    id:                  ticket.id,
+    displayId:            ticket.displayId,
+    fairId:               ticket.fair?.id,
+    fairName:             ticket.fair?.name,
+    rideId:               ticket.ride?.id,
+    rideName:             ticket.ride?.name,
+    rideEmoji:            ticket.ride?.emoji,
+    rideCoverGradient:    ticket.ride?.coverGradient,
+    customerId:           ticket.customer?.id,
+    customerName:         ticket.customer?.name,
+    customerEmail:        ticket.customer?.email,
+    quantity:             ticket.quantity,
+    pricePerPerson:       ticket.pricePerPerson,
+    totalAmount:          ticket.totalAmount,
+    paymentMethod:        ticket.paymentMethod,
+    paymentStatus:        ticket.paymentStatus,
+    ticketStatus:         ticket.ticketStatus,
+    bookedAt:             ticket.createdAt,
+    eventDate:            ticket.eventDate,
+    redeemedAt:           ticket.redeemedAt ?? undefined,
+    redeemedByStaffId:    ticket.redeemedByStaff?.id,
+    redeemedByStaffName:  ticket.redeemedByStaff?.user?.name,
+    redeemedAtGate:       ticket.redeemedAtGate ?? undefined,
+  };
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 @Injectable()
 export class TicketsService {
@@ -86,31 +128,39 @@ export class TicketsService {
   ) {}
 
   async getMyTickets(customerId: string) {
-    return this.tickets.find({
+    const tickets = await this.tickets.find({
       where:     { customer: { id: customerId }, paymentStatus: PaymentStatus.PAID },
-      relations: ["ride", "fair"],
+      relations: ["ride", "fair", "customer"],
       order:     { createdAt: "DESC" },
     });
+    return tickets.map(toTicketDto);
   }
 
   async getTicketById(id: string, customerId: string) {
     const ticket = await this.tickets.findOne({
       where:     { id, customer: { id: customerId } },
-      relations: ["ride", "fair", "redeemedByStaff", "redeemedByStaff.user"],
+      relations: ["ride", "fair", "customer", "redeemedByStaff", "redeemedByStaff.user"],
     });
     if (!ticket) throw new NotFoundException("Ticket not found");
-    return ticket;
+    return toTicketDto(ticket);
   }
 
   /** Generate a QR data URL for display — purely visual, not for validation */
-  async getTicketQR(displayId: string, customerId: string): Promise<string> {
+  async getTicketQR(displayId: string, customerId: string): Promise<{ qrDataUrl: string }> {
     const ticket = await this.tickets.findOne({
       where: { displayId, customer: { id: customerId } },
       select: ["id", "qrToken", "ticketStatus"],
     });
     if (!ticket) throw new NotFoundException("Ticket not found");
     // Encode only the opaque token — no user data embedded in QR
-    return QRCode.toDataURL(ticket.qrToken, { errorCorrectionLevel: "H", margin: 1 });
+    const qrDataUrl = await QRCode.toDataURL(ticket.qrToken, { errorCorrectionLevel: "H", margin: 1 });
+    // FIX: this returned the raw data-URL string. The response interceptor
+    // wraps it as `{ success, data: "data:image/..." }`, so the frontend's
+    // unwrapped result was a bare string — but `getTicketQr()` on the
+    // frontend destructures `{ qrDataUrl }` from it, which is `undefined`
+    // on a string. Wrapping it here in the object shape the frontend
+    // actually expects fixes the QR code from silently failing to render.
+    return { qrDataUrl };
   }
 
   // ── ATOMIC REDEMPTION ───────────────────────────────────────────────────────
@@ -283,12 +333,21 @@ export class TicketsService {
         outcome: ScanOutcome.VALID,
         message: "Ticket validated. Entry granted.",
         ticket: {
-          id:           ticket.id,
-          displayId:    ticket.displayId,
-          quantity:     ticket.quantity,
-          customerName: ticket.customer?.name,
-          rideName:     ticket.ride?.name,
-          eventDate:    ticket.eventDate,
+          id:            ticket.id,
+          displayId:     ticket.displayId,
+          quantity:      ticket.quantity,
+          customerName:  ticket.customer?.name,
+          rideName:      ticket.ride?.name,
+          eventDate:     ticket.eventDate,
+          // FIX: the scanner app's success receipt reads
+          // `result.ticket.paymentMethod` and `result.ticket.totalAmount`
+          // (scanner-ui.tsx) but neither was ever included here — every
+          // successful scan showed "undefined · ₹undefined" for the payment
+          // line. `totalAmount` is now a real number too (see the shared
+          // decimalTransformer fix on TicketEntity), not the raw Postgres
+          // string it used to be.
+          paymentMethod: ticket.paymentMethod,
+          totalAmount:   ticket.totalAmount,
         },
       };
     });
