@@ -6,7 +6,27 @@
 import {
   Entity, PrimaryGeneratedColumn, Column, CreateDateColumn,
   UpdateDateColumn, ManyToOne, OneToMany, JoinColumn, Index, Unique, Relation,
+  RelationId, ValueTransformer,
 } from "typeorm";
+
+/**
+ * FIX: Postgres `numeric`/`decimal` columns come back from `pg` (and thus
+ * TypeORM) as STRINGS by default — not JS numbers — to avoid silent
+ * floating-point precision loss. Every `type: "decimal"` column below was
+ * typed as `number` in TypeScript but actually returned a string at
+ * runtime. That's a silent contract break with real consequences:
+ * `0 + ticket.totalAmount` string-concatenates instead of adding,
+ * `formatCurrency(ride.pricePerPerson)` skips thousands separators, and any
+ * strict `typeof x === "number"` check (as used in the hardened
+ * `formatCurrency` on the frontend) treats a valid price as invalid.
+ * A shared transformer applied to every decimal column fixes this once, at
+ * the ORM boundary, instead of needing `Number(...)` coercion at every call
+ * site across both codebases.
+ */
+const decimalTransformer: ValueTransformer = {
+  to: (value?: number | null) => value,
+  from: (value?: string | null) => (value === null || value === undefined ? value : parseFloat(value)),
+};
 
 // ── USER / ROLES ──────────────────────────────────────────────────────────────
 
@@ -147,6 +167,15 @@ export class FairEntity {
   @JoinColumn()
   operator: OperatorEntity;
 
+  /**
+   * FIX: same issue as RideEntity.fairId — the frontend's `Fair` type
+   * expects a flat `operatorId` string, but this entity only ever exposed
+   * the full `operator` relation object. `@RelationId` reads the existing
+   * FK column (no migration) and populates this scalar automatically.
+   */
+  @RelationId((fair: FairEntity) => fair.operator)
+  operatorId: string;
+
   @OneToMany(() => RideEntity, (r) => r.fair)
   rides: RideEntity[];
 
@@ -182,7 +211,7 @@ export class RideEntity {
   @Column({ nullable: true })
   coverGradient: string;
 
-  @Column({ type: "decimal", precision: 10, scale: 2 })
+  @Column({ type: "decimal", precision: 10, scale: 2, transformer: decimalTransformer })
   pricePerPerson: number;
 
   @Column({ type: "int", default: 5 })
@@ -194,7 +223,7 @@ export class RideEntity {
   @Column({ type: "int", default: 10 })
   capacity: number;
 
-  @Column({ type: "decimal", precision: 3, scale: 1, default: 0 })
+  @Column({ type: "decimal", precision: 3, scale: 1, default: 0, transformer: decimalTransformer })
   rating: number;
 
   @Column({ type: "int", default: 0 })
@@ -206,6 +235,20 @@ export class RideEntity {
   @ManyToOne(() => FairEntity, (f) => f.rides)
   @JoinColumn()
   fair: FairEntity;
+
+  /**
+   * FIX: the frontend's `Ride` type has always expected a flat `fairId`
+   * string (used for the ride-detail page's "back to fair" link, the cart
+   * item, and checkout display) — but this entity only ever exposed the
+   * full `fair` relation object, and only when it was explicitly eager-
+   * loaded. Every real (non-mock) API response had `fairId: undefined`.
+   * `@RelationId` reads the same foreign-key column the `fair` relation
+   * already uses — no new DB column, no migration — and populates this
+   * scalar automatically on ordinary `find()`/`findOne()` calls, even when
+   * `fair` itself isn't eager-loaded.
+   */
+  @RelationId((ride: RideEntity) => ride.fair)
+  fairId: string;
 
   @OneToMany(() => StaffEntity, (s) => s.assignedRide)
   assignedStaff: Relation<StaffEntity[]>;
@@ -240,10 +283,10 @@ export class TicketEntity {
   @Column()
   quantity: number;
 
-  @Column({ type: "decimal", precision: 10, scale: 2 })
+  @Column({ type: "decimal", precision: 10, scale: 2, transformer: decimalTransformer })
   pricePerPerson: number;
 
-  @Column({ type: "decimal", precision: 10, scale: 2 })
+  @Column({ type: "decimal", precision: 10, scale: 2, transformer: decimalTransformer })
   totalAmount: number;
 
   @Column({ type: "enum", enum: PaymentMethod })
@@ -317,7 +360,7 @@ export class PaymentEntity {
   @Column({ nullable: true })
   razorpaySignature: string;
 
-  @Column({ type: "decimal", precision: 10, scale: 2 })
+  @Column({ type: "decimal", precision: 10, scale: 2, transformer: decimalTransformer })
   amount: number;
 
   @Column({ length: 3, default: "INR" })
@@ -522,7 +565,7 @@ export class OperatorTransactionEntity {
   @Column({ type: "enum", enum: OperatorTransactionStatus, default: OperatorTransactionStatus.PENDING })
   status: OperatorTransactionStatus;
 
-  @Column({ type: "decimal", precision: 12, scale: 2 })
+  @Column({ type: "decimal", precision: 12, scale: 2, transformer: decimalTransformer })
   amount: number;
 
   @Column({ length: 3, default: "INR" })
