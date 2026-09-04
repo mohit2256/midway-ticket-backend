@@ -24,7 +24,7 @@ import { Cache } from "cache-manager";
 import { v4 as uuidv4 } from "uuid";
 import * as QRCode from "qrcode";
 import {
-  TicketEntity, TicketStatus, PaymentStatus,
+  TicketEntity, TicketStatus, PaymentStatus, PaymentMethod,
   StaffEntity, ScanLogEntity, ScanOutcome, RideEntity, NotificationType,
 } from "../entities";
 import { IsString, IsUUID } from "class-validator";
@@ -59,7 +59,26 @@ class RedeemTicketDto {
 export interface RedeemResult {
   outcome: ScanOutcome;
   message: string;
-  ticket?: Partial<TicketEntity>;
+  /**
+   * FIX: this was `Partial<TicketEntity>` — but the object actually
+   * constructed below (`customerName`, `rideName`) has never matched
+   * `TicketEntity`'s real shape (which only has `customer`/`ride` relation
+   * objects, no flat name fields). TypeScript's excess-property check on
+   * that literal return was a genuine compile error under this project's
+   * `noImplicitAny`/`strictNullChecks` tsconfig — `nest build` (a real
+   * `tsc` type-check, not transpile-only) fails on it, which is why the
+   * Railway deploy never went live. Typed to match exactly what's built.
+   */
+  ticket?: {
+    id: string;
+    displayId: string;
+    quantity: number;
+    customerName?: string;
+    rideName?: string;
+    eventDate: string;
+    paymentMethod: PaymentMethod;
+    totalAmount: number;
+  };
   actualRideName?: string;
   redeemedAt?: Date;
   redeemedByStaffName?: string;
