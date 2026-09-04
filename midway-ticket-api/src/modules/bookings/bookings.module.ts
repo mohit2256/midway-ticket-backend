@@ -40,6 +40,7 @@ import { JwtAuthGuard, CurrentUser, Roles, RolesGuard } from "../../common/guard
 import { UserRole } from "../entities";
 import { NotificationsService } from "../notifications/notifications.module";
 import { NotificationsModule } from "../notifications/notifications.module";
+import { toTicketDto } from "../tickets/tickets.module";
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -49,7 +50,7 @@ export class CreateBookingDto {
   // Only meaningful once PAYMENTS_ENABLED=true. Frontend can omit this
   // entirely in launch mode; validation below allows it to be absent.
   @ApiPropertyOptional() @IsOptional() @IsEnum(PaymentMethod) paymentMethod?: PaymentMethod;
-  @ApiPropertyOptional() @IsOptional() @IsEmail() customerEmail?: string;
+  @ApiPropertyOptional() @IsEmail()  @IsString() customerEmail?: string;
 }
 
 export class VerifyPaymentDto {
@@ -520,7 +521,21 @@ export class BookingsService {
       fair:          { id: ride.fair.id } as FairEntity,
       payment,
     });
-    return em.getRepository(TicketEntity).save(ticket);
+    const saved = await em.getRepository(TicketEntity).save(ticket);
+
+    // FIX: this used to return the just-saved entity as-is, which only had
+    // `{ id }` stubs for `customer`/`ride`/`fair` (exactly what was assigned
+    // above) — none of the flat display fields (`rideName`, `fairName`,
+    // `customerName`, etc.) the frontend `Ticket` type expects. That's what
+    // made the "just booked" ticket card show blank right after checkout.
+    // Reload with the relations loaded and route through the same
+    // `toTicketDto` every other ticket-reading endpoint uses, so this
+    // response is never a special, differently-shaped case.
+    const full = await em.getRepository(TicketEntity).findOne({
+      where:     { id: saved.id },
+      relations: ["ride", "fair", "customer"],
+    });
+    return toTicketDto(full!);
   }
 }
 
