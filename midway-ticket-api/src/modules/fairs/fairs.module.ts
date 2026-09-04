@@ -129,7 +129,7 @@ export class FairsService {
    * eager-loads `rides`, so this is a plain in-memory reduction, not an
    * extra query.
    */
-  private attachFairStats<T extends FairEntity>(fair: T): T & { totalRides: number; minTicketPrice: number } {
+  private attachFairStats(fair: FairEntity): FairEntity & { totalRides: number; minTicketPrice: number } {
     const rides = fair.rides ?? [];
     const prices = rides.map((r) => Number(r.pricePerPerson)).filter((p) => Number.isFinite(p));
     return {
