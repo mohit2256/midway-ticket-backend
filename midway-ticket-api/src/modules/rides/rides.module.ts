@@ -8,7 +8,7 @@ import { Controller, Get, Post, Patch, Body, Param, UseGuards } from "@nestjs/co
 import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { RideEntity, FairEntity, RideCategory, RideStatus } from "../entities";
+import { RideEntity, FairEntity, TicketEntity, RideCategory, RideStatus, PaymentStatus } from "../entities";
 import { JwtAuthGuard, RolesGuard, Roles, CurrentUser } from "../../common/guards/auth.guards";
 import { UserRole } from "../entities";
 import { LruCache } from "../../common/cache/lru-cache";
@@ -36,23 +36,68 @@ export class RidesService {
   private readonly rideCache = new LruCache<string, RideEntity>(200);
 
   constructor(
-    @InjectRepository(RideEntity)  private rides: Repository<RideEntity>,
-    @InjectRepository(FairEntity)  private fairs: Repository<FairEntity>,
+    @InjectRepository(RideEntity)   private rides:   Repository<RideEntity>,
+    @InjectRepository(FairEntity)   private fairs:   Repository<FairEntity>,
+    @InjectRepository(TicketEntity) private tickets: Repository<TicketEntity>,
   ) {}
 
   async findByFair(fairId: string) {
-    return this.rides.find({ where: { fair: { id: fairId } }, order: { createdAt: "ASC" } });
+    const rides = await this.rides.find({ where: { fair: { id: fairId } }, order: { createdAt: "ASC" } });
+    return this.attachRideStats(rides);
   }
 
   async findOne(id: string) {
     const cached = this.rideCache.get(id);
-    if (cached) return cached;
+    if (cached) return (await this.attachRideStats([cached]))[0];
 
     const r = await this.rides.findOne({ where: { id }, relations: ["fair"] });
     if (!r) throw new NotFoundException("Ride not found");
 
     this.rideCache.set(id, r);
-    return r;
+    return (await this.attachRideStats([r]))[0];
+  }
+
+  /**
+   * FIX: the frontend's `Ride` type expects `ticketsSoldToday` and
+   * `totalRevenue` on every ride — the operator Rides page renders both
+   * directly, including `formatCurrency(ride.totalRevenue)`, which threw
+   * (`undefined.toLocaleString(...)`) and crashed the whole page for any
+   * ride created through the real API, because neither field existed on
+   * `RideEntity` at all. These are computed here (not stored columns) via
+   * one grouped query for the whole batch — same join-based style as
+   * AnalyticsService's ridePerformance query, so this avoids guessing the
+   * actual FK column name and stays correct regardless of TypeORM's naming
+   * strategy.
+   */
+  private async attachRideStats(rides: RideEntity[]) {
+    if (rides.length === 0) return [];
+    const ids = rides.map((r) => r.id);
+    const today = new Date().toISOString().split("T")[0];
+
+    const rows = await this.tickets
+      .createQueryBuilder("t")
+      .leftJoin("t.ride", "r")
+      .select("r.id", "rideid")
+      .addSelect("COUNT(t.id) FILTER (WHERE DATE(t.createdAt) = :today)", "ticketstoday")
+      .addSelect("COALESCE(SUM(t.totalAmount), 0)", "totalrevenue")
+      .where("r.id IN (:...ids)", { ids })
+      .andWhere("t.paymentStatus = :paid", { paid: PaymentStatus.PAID })
+      .groupBy("r.id")
+      .setParameter("today", today)
+      .getRawMany();
+
+    const statsById = new Map<string, { ticketstoday: string; totalrevenue: string }>(
+      rows.map((row: any) => [row.rideid, row]),
+    );
+
+    return rides.map((ride) => {
+      const stats = statsById.get(ride.id);
+      return {
+        ...ride,
+        ticketsSoldToday: Number(stats?.ticketstoday) || 0,
+        totalRevenue:     Number(stats?.totalrevenue) || 0,
+      };
+    });
   }
 
   /**
@@ -74,7 +119,8 @@ export class RidesService {
       throw new ForbiddenException("You do not own this fair");
     }
 
-    return this.rides.save(this.rides.create({ ...dto, fair }));
+    const saved = await this.rides.save(this.rides.create({ ...dto, fair }));
+    return (await this.attachRideStats([saved]))[0];
   }
 
   /**
@@ -99,7 +145,7 @@ export class RidesService {
     const saved = await this.rides.save(ride);
     // Invalidate cache — stale price/status is worse than a miss.
     this.rideCache.delete(id);
-    return saved;
+    return (await this.attachRideStats([saved]))[0];
   }
 }
 
@@ -144,7 +190,7 @@ export class RidesController {
 }
 
 @Module({
-  imports: [TypeOrmModule.forFeature([RideEntity, FairEntity])],
+  imports: [TypeOrmModule.forFeature([RideEntity, FairEntity, TicketEntity])],
   controllers: [RidesController],
   providers: [RidesService],
   exports: [RidesService],
