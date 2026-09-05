@@ -53,18 +53,47 @@ export class PartitionMaintenanceService implements OnModuleInit {
    * the API continues starting normally instead of crashing.
    */
   async onModuleInit(): Promise<void> {
-    await this.queue.add(
-      "extend-partitions",
-      {},
-      {
-        jobId: "monthly-partition-extend",
-        repeat: {
-          pattern: "0 3 1 * *",
-        },
-      },
-    );
+    // FIX: `queue.add()` awaits a real Redis round-trip. ioredis queues
+    // commands internally and keeps waiting rather than failing fast if the
+    // connection is slow to establish or briefly unreachable — with no
+    // bounded timeout, this await could hang indefinitely. Since this hook
+    // runs during NestFactory.create(), a hung call here silently blocked
+    // the ENTIRE application from ever finishing boot: no crash, no error,
+    // just permanent silence until the platform's healthcheck gave up. This
+    // file's own header comment already states the service "MUST NOT crash
+    // the entire API" — that guarantee only covered the missing-table case,
+    // not a Redis hiccup on this specific call, which is a separate failure
+    // mode this try/catch now actually covers.
+    try {
+      await Promise.race([
+        this.queue.add(
+          "extend-partitions",
+          {},
+          {
+            jobId: "monthly-partition-extend",
+            repeat: { pattern: "0 3 1 * *" },
+          },
+        ),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Scheduling monthly partition job timed out after 5s")), 5000),
+        ),
+      ]);
+    } catch (err) {
+      this.logger.warn(
+        `Could not schedule monthly partition-extend job (continuing app startup anyway): ${(err as Error).message}`,
+      );
+    }
 
-    await this.extendPartitions();
+    try {
+      await Promise.race([
+        this.extendPartitions(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Initial partition extend timed out after 10s")), 10_000),
+        ),
+      ]);
+    } catch (err) {
+      this.logger.warn(`Initial partition maintenance run failed (continuing app startup anyway): ${(err as Error).message}`);
+    }
   }
 
   /**
