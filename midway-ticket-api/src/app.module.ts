@@ -59,20 +59,53 @@ import { appConfig, databaseConfig } from "./config/app.config";
     CacheModule.registerAsync({
       isGlobal: true,
       inject: [ConfigService],
-      useFactory: async (cfg: ConfigService) => ({
-        store:    (await import("cache-manager-redis-yet")).redisStore,
-        socket:   { host: cfg.get("REDIS_HOST","localhost"), port: cfg.get<number>("REDIS_PORT",6379) },
-        password: cfg.get("REDIS_PASSWORD"),
-        ttl:      60_000,
-      }),
+      useFactory: async (cfg: ConfigService) => {
+        const host     = cfg.get("REDIS_HOST", "localhost");
+        const port     = cfg.get<number>("REDIS_PORT", 6379);
+        const password = cfg.get("REDIS_PASSWORD");
+
+        // FIX: cache-manager-redis-yet's redisStore() does `await client.connect()`
+        // with no bounded timeout. If Redis is unreachable for any reason, that
+        // await never resolves or rejects — it just hangs. Since this factory
+        // itself is awaited during NestFactory.create(), an unreachable Redis
+        // silently blocked the ENTIRE app from ever starting, with zero log
+        // output and zero errors (exactly what production showed: 3+ minutes,
+        // 8 healthcheck attempts, nothing in the logs after migrations). A
+        // caching layer being briefly unavailable should degrade gracefully,
+        // not take down ticket booking / fairs listing / login with it.
+        try {
+          const { redisStore } = await import("cache-manager-redis-yet");
+          const store = await Promise.race([
+            redisStore({
+              socket: { host, port, connectTimeout: 5000, reconnectStrategy: false },
+              password,
+              ttl: 60_000,
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("Redis connect timed out after 5s")), 5000),
+            ),
+          ]);
+          console.log(`✅ Connected to Redis cache store at ${host}:${port}`);
+          return { store };
+        } catch (err) {
+          console.error(
+            `⚠️  Redis cache unavailable at ${host}:${port} (${(err as Error).message}) — ` +
+            `falling back to in-memory cache. The app will still start; caching just ` +
+            `won't be shared across instances until Redis is reachable again.`,
+          );
+          return {}; // cache-manager's built-in in-memory store
+        }
+      },
     }),
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (cfg: ConfigService) => ({
         connection: {
-          host:     cfg.get("REDIS_HOST","localhost"),
-          port:     cfg.get<number>("REDIS_PORT",6379),
-          password: cfg.get("REDIS_PASSWORD"),
+          host:               cfg.get("REDIS_HOST", "localhost"),
+          port:               cfg.get<number>("REDIS_PORT", 6379),
+          password:           cfg.get("REDIS_PASSWORD"),
+          connectTimeout:     5000,
+          maxRetriesPerRequest: null, // required by BullMQ; queue jobs simply wait/retry rather than the client giving up mid-command
         },
       }),
     }),
