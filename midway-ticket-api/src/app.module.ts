@@ -105,6 +105,14 @@ import { appConfig, databaseConfig } from "./config/app.config";
           port:               cfg.get<number>("REDIS_PORT", 6379),
           password:           cfg.get("REDIS_PASSWORD"),
           connectTimeout:     5000,
+          // FIX: bounds every individual Redis command issued through any
+          // queue/worker sharing this connection (not just the initial TCP
+          // connect). Without this, a command issued before the connection
+          // is fully established — e.g. PartitionMaintenanceService's
+          // queue.add() in onModuleInit() — sits in ioredis's internal
+          // offline queue with no deadline, which is exactly what silently
+          // hung the whole app at boot with zero log output.
+          commandTimeout:       5000,
           maxRetriesPerRequest: null, // required by BullMQ; queue jobs simply wait/retry rather than the client giving up mid-command
         },
       }),
