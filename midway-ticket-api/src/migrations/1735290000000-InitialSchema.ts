@@ -212,7 +212,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "users" (
+      CREATE TABLE IF NOT EXISTS "users" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "name" character varying NOT NULL,
         "email" character varying NOT NULL,
@@ -232,7 +232,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_users_email"
+      CREATE INDEX IF NOT EXISTS "IDX_users_email"
       ON "users" ("email")
     `);
 
@@ -241,7 +241,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "operators" (
+      CREATE TABLE IF NOT EXISTS "operators" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "name" character varying NOT NULL,
         "plan" "subscription_plan_enum" NOT NULL DEFAULT 'TRIAL',
@@ -264,7 +264,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_operators_ownerId"
+      CREATE INDEX IF NOT EXISTS "IDX_operators_ownerId"
       ON "operators" ("ownerId")
     `);
 
@@ -273,7 +273,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "fairs" (
+      CREATE TABLE IF NOT EXISTS "fairs" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "name" character varying NOT NULL,
         "location" character varying NOT NULL,
@@ -301,7 +301,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_fairs_operatorId"
+      CREATE INDEX IF NOT EXISTS "IDX_fairs_operatorId"
       ON "fairs" ("operatorId")
     `);
 
@@ -310,7 +310,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "rides" (
+      CREATE TABLE IF NOT EXISTS "rides" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "name" character varying NOT NULL,
         "description" text,
@@ -340,7 +340,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_rides_fairId"
+      CREATE INDEX IF NOT EXISTS "IDX_rides_fairId"
       ON "rides" ("fairId")
     `);
 
@@ -349,7 +349,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "payments" (
+      CREATE TABLE IF NOT EXISTS "payments" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "razorpayOrderId" character varying,
         "razorpayPaymentId" character varying,
@@ -383,12 +383,12 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_payments_customerId"
+      CREATE INDEX IF NOT EXISTS "IDX_payments_customerId"
       ON "payments" ("customerId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_payments_rideId"
+      CREATE INDEX IF NOT EXISTS "IDX_payments_rideId"
       ON "payments" ("rideId")
     `);
 
@@ -397,7 +397,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "staff" (
+      CREATE TABLE IF NOT EXISTS "staff" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "gate" character varying NOT NULL DEFAULT 'Gate 1',
         "isActive" boolean NOT NULL DEFAULT true,
@@ -444,22 +444,22 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_staff_userId"
+      CREATE INDEX IF NOT EXISTS "IDX_staff_userId"
       ON "staff" ("userId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_staff_operatorId"
+      CREATE INDEX IF NOT EXISTS "IDX_staff_operatorId"
       ON "staff" ("operatorId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_staff_fairId"
+      CREATE INDEX IF NOT EXISTS "IDX_staff_fairId"
       ON "staff" ("fairId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_staff_assignedRideId"
+      CREATE INDEX IF NOT EXISTS "IDX_staff_assignedRideId"
       ON "staff" ("assignedRideId")
     `);
 
@@ -468,7 +468,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "tickets" (
+      CREATE TABLE IF NOT EXISTS "tickets" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "displayId" character varying NOT NULL,
         "quantity" integer NOT NULL,
@@ -531,27 +531,27 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_tickets_qrToken"
+      CREATE INDEX IF NOT EXISTS "IDX_tickets_qrToken"
       ON "tickets" ("qrToken")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_tickets_displayId"
+      CREATE INDEX IF NOT EXISTS "IDX_tickets_displayId"
       ON "tickets" ("displayId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_tickets_customerId"
+      CREATE INDEX IF NOT EXISTS "IDX_tickets_customerId"
       ON "tickets" ("customerId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_tickets_rideId"
+      CREATE INDEX IF NOT EXISTS "IDX_tickets_rideId"
       ON "tickets" ("rideId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_tickets_fairId"
+      CREATE INDEX IF NOT EXISTS "IDX_tickets_fairId"
       ON "tickets" ("fairId")
     `);
 
@@ -560,7 +560,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "scan_logs" (
+      CREATE TABLE IF NOT EXISTS "scan_logs" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "outcome" "scan_outcome_enum" NOT NULL,
         "scannedToken" character varying,
@@ -587,12 +587,12 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_scan_logs_staffId"
+      CREATE INDEX IF NOT EXISTS "IDX_scan_logs_staffId"
       ON "scan_logs" ("staffId")
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_scan_logs_ticketId"
+      CREATE INDEX IF NOT EXISTS "IDX_scan_logs_ticketId"
       ON "scan_logs" ("ticketId")
     `);
 
@@ -601,7 +601,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "notifications" (
+      CREATE TABLE IF NOT EXISTS "notifications" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "type" "notification_type_enum" NOT NULL,
         "channel" "notification_channel_enum" NOT NULL DEFAULT 'IN_APP',
@@ -631,7 +631,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_notifications_recipientUser_createdAt"
+      CREATE INDEX IF NOT EXISTS "IDX_notifications_recipientUser_createdAt"
       ON "notifications" ("recipientUserId", "createdAt")
     `);
 
@@ -640,7 +640,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     // ────────────────────────────────────────────────────────────────────────
 
     await queryRunner.query(`
-      CREATE TABLE "operator_transactions" (
+      CREATE TABLE IF NOT EXISTS "operator_transactions" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "type" "operator_transaction_type_enum" NOT NULL,
         "status" "operator_transaction_status_enum" NOT NULL DEFAULT 'PENDING',
@@ -664,7 +664,7 @@ export class InitialSchema1735290000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
-      CREATE INDEX "IDX_operator_transactions_operatorId"
+      CREATE INDEX IF NOT EXISTS "IDX_operator_transactions_operatorId"
       ON "operator_transactions" ("operatorId")
     `);
   }
