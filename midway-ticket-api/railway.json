@@ -5,7 +5,7 @@
     "buildCommand": "npm install && npm run build"
   },
   "deploy": {
-    "startCommand": "node node_modules/.bin/typeorm migration:run -d dist/config/typeorm-cli.datasource.js && node dist/main",
+    "startCommand": "node dist/main",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 180,
     "restartPolicyType": "ON_FAILURE"
