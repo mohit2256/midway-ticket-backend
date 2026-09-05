@@ -56,6 +56,59 @@ export class StaffService {
   ) {}
 
   /**
+   * FIX: the frontend's `StaffMember` type expects flat fields —
+   * `name`, `email`, `phone`, `fairName`, `rideName`, and a
+   * `status: "Active" | "Inactive"` string. `StaffEntity` only ever exposed
+   * these nested under `user`/`fair`/`assignedRide`, plus an `isActive`
+   * boolean instead of `status` — so every real (non-mock) response left
+   * `name`/`email`/`fairName`/`rideName`/`status` all `undefined`. The
+   * operator Staff page renders `s.name.charAt(0)` on the very first row,
+   * which threw (`undefined.charAt is not a function`) and crashed the
+   * whole page — same root cause pattern as the Rides stats bug. This maps
+   * the entity (with `user`/`fair`/`assignedRide` relations loaded) onto
+   * the exact shape the frontend expects, same style as RidesService's
+   * `attachRideStats`.
+   */
+  private toStaffMember(member: StaffEntity) {
+    return {
+      id:          member.id,
+      name:        member.user?.name ?? "",
+      email:       member.user?.email ?? "",
+      phone:       member.user?.phone ?? "",
+      operatorId:  member.operator?.id ?? "",
+      fairId:      member.fair?.id ?? "",
+      fairName:    member.fair?.name ?? "",
+      rideId:      member.assignedRide?.id ?? "",
+      rideName:    member.assignedRide?.name ?? "",
+      gate:        member.gate,
+      status:      member.isActive ? "Active" : "Inactive",
+      scansToday:  member.scansToday,
+      scansTotal:  member.scansTotal,
+      lastScanAt:  member.lastScanAt ?? null,
+      joinedAt:    member.createdAt,
+    };
+  }
+
+  /**
+   * FIX: same flattening problem as `toStaffMember` above — the frontend's
+   * `ScanHistoryEntry` type expects `ticketId`, `customerName`, and
+   * `quantity` as flat fields, but they only ever existed nested under
+   * `ticket`/`ticket.customer`. Not wired up in the UI yet (the "View"
+   * button on the Staff page has no handler), but fixed now so it doesn't
+   * repeat the same crash the moment that button is wired up.
+   */
+  private toScanHistoryEntry(log: ScanLogEntity) {
+    return {
+      id:           log.id,
+      ticketId:     log.ticket?.displayId ?? "",
+      customerName: log.ticket?.customer?.name ?? "Unknown",
+      quantity:     log.ticket?.quantity ?? 0,
+      scannedAt:    log.scannedAt,
+      outcome:      log.outcome,
+    };
+  }
+
+  /**
    * Resolve the OperatorEntity that belongs to this authenticated user.
    * Throws ForbiddenException if the user has no operator profile — prevents
    * any operator-scoped action from falling through with a wrong/stale id.
@@ -67,11 +120,12 @@ export class StaffService {
   }
 
   async findAll(operatorId: string) {
-    return this.staff.find({
+    const members = await this.staff.find({
       where:     { operator: { id: operatorId } },
       relations: ["user", "assignedRide", "fair"],
       order:     { createdAt: "DESC" },
     });
+    return members.map((m) => this.toStaffMember(m));
   }
 
   async findOne(id: string, operatorId: string) {
@@ -80,7 +134,7 @@ export class StaffService {
       relations: ["user", "assignedRide", "fair"],
     });
     if (!member) throw new NotFoundException("Staff member not found");
-    return member;
+    return this.toStaffMember(member);
   }
 
   async getScanHistory(staffId: string, operatorId: string) {
@@ -89,12 +143,13 @@ export class StaffService {
     });
     if (!member) throw new NotFoundException("Staff member not found");
 
-    return this.scanLogs.find({
+    const logs = await this.scanLogs.find({
       where:   { staff: { id: staffId } },
       order:   { scannedAt: "DESC" },
       take:    50,
-      relations: ["ticket"],
+      relations: ["ticket", "ticket.customer"],
     });
+    return logs.map((l) => this.toScanHistoryEntry(l));
   }
 
   async create(dto: CreateStaffDto, operatorId: string) {
@@ -133,13 +188,18 @@ export class StaffService {
       assignedRide: ride,
     });
 
-    return this.staff.save(member);
+    const saved = await this.staff.save(member);
+    saved.user = user;
+    saved.fair = fair;
+    saved.assignedRide = ride;
+    saved.operator = operator;
+    return this.toStaffMember(saved);
   }
 
   async update(id: string, dto: UpdateStaffDto, operatorId: string) {
     const member = await this.staff.findOne({
       where:     { id, operator: { id: operatorId } },
-      relations: ["assignedRide"],
+      relations: ["user", "assignedRide", "fair", "operator"],
     });
     if (!member) throw new NotFoundException("Staff member not found");
 
@@ -151,7 +211,8 @@ export class StaffService {
     if (dto.gate     !== undefined) member.gate     = dto.gate;
     if (dto.isActive !== undefined) member.isActive = dto.isActive;
 
-    return this.staff.save(member);
+    const saved = await this.staff.save(member);
+    return this.toStaffMember(saved);
   }
 
   async deactivate(id: string, operatorId: string) {
