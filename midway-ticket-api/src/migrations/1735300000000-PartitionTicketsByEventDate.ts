@@ -53,7 +53,43 @@ export class PartitionTicketsByEventDate1735300000000 implements MigrationInterf
   name = "PartitionTicketsByEventDate1735300000000";
 
   public async up(queryRunner: QueryRunner): Promise<void> {
-    // ── 0. Drop the FK that can't survive partitioning (see trade-off #2) ──
+    // ── 0a. Idempotency guard ────────────────────────────────────────────────
+    // This migration is a rename → create → copy-data → drop sequence, not a
+    // simple set of independently-guardable DDL statements — if a previous
+    // run got killed partway through (e.g. by a platform healthcheck timeout,
+    // which is exactly what happened once in this project's history), retrying
+    // from the top could collide with whatever state it left behind (a
+    // half-renamed table, partially-copied data, etc). Rather than trying to
+    // resume from an unknown partial state, detect whether `tickets` is
+    // *already* the partitioned table (relkind = 'p' — the same check
+    // PartitionMaintenanceService uses elsewhere) and, if so, treat this
+    // migration as already complete and exit early.
+    const alreadyPartitioned = await queryRunner.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'tickets' AND n.nspname = 'public' AND c.relkind = 'p'
+      ) AS "exists"
+    `);
+    if (alreadyPartitioned?.[0]?.exists === true) {
+      return;
+    }
+
+    // Self-heal a partial prior run: if a previous attempt got killed right
+    // after the rename below but before the partitioned table was created,
+    // `tickets_legacy` would exist with no `tickets` table at all — which
+    // would break both this migration's retry and the running app. Restore
+    // it before proceeding.
+    const orphanedLegacy = await queryRunner.query(`
+      SELECT
+        EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'tickets_legacy' AND schemaname = 'public') AS "legacyExists",
+        EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'tickets'        AND schemaname = 'public') AS "ticketsExists"
+    `);
+    if (orphanedLegacy?.[0]?.legacyExists === true && orphanedLegacy?.[0]?.ticketsExists === false) {
+      await queryRunner.query(`ALTER TABLE tickets_legacy RENAME TO tickets`);
+    }
+
+    // ── 0b. Drop the FK that can't survive partitioning (see trade-off #2) ──
     await queryRunner.query(`
       DO $$
       DECLARE
@@ -121,11 +157,11 @@ export class PartitionTicketsByEventDate1735300000000 implements MigrationInterf
     await queryRunner.query(`INSERT INTO tickets SELECT * FROM tickets_legacy`);
 
     // ── 5. Recreate indexes (see trade-off #1 on qrToken/displayId) ─────────
-    await queryRunner.query(`CREATE UNIQUE INDEX "UQ_tickets_qrToken_eventDate" ON tickets ("qrToken", "eventDate")`);
-    await queryRunner.query(`CREATE UNIQUE INDEX "UQ_tickets_displayId_eventDate" ON tickets ("displayId", "eventDate")`);
-    await queryRunner.query(`CREATE INDEX "IDX_tickets_fairId" ON tickets ("fairId")`);
-    await queryRunner.query(`CREATE INDEX "IDX_tickets_rideId" ON tickets ("rideId")`);
-    await queryRunner.query(`CREATE INDEX "IDX_tickets_customerId" ON tickets ("customerId")`);
+    await queryRunner.query(`CREATE UNIQUE INDEX IF NOT EXISTS "UQ_tickets_qrToken_eventDate" ON tickets ("qrToken", "eventDate")`);
+    await queryRunner.query(`CREATE UNIQUE INDEX IF NOT EXISTS "UQ_tickets_displayId_eventDate" ON tickets ("displayId", "eventDate")`);
+    await queryRunner.query(`CREATE INDEX IF NOT EXISTS "IDX_tickets_fairId" ON tickets ("fairId")`);
+    await queryRunner.query(`CREATE INDEX IF NOT EXISTS "IDX_tickets_rideId" ON tickets ("rideId")`);
+    await queryRunner.query(`CREATE INDEX IF NOT EXISTS "IDX_tickets_customerId" ON tickets ("customerId")`);
 
     // ── 6. Restore ticketId index on scan_logs (no FK — see trade-off #2) ──
     await queryRunner.query(`
