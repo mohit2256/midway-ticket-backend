@@ -10,6 +10,7 @@ import { FairsModule }    from "./modules/fairs/fairs.module";
 import { RidesModule }    from "./modules/rides/rides.module";
 import { TicketsModule }  from "./modules/tickets/tickets.module";
 import { BookingsModule } from "./modules/bookings/bookings.module";
+import { EventsModule }   from "./modules/events/events.module";
 import { PaymentsModule } from "./modules/payments/payments.module";
 import { StaffModule }    from "./modules/staff/staff.module";
 import { AnalyticsModule }from "./modules/analytics/analytics.module";
@@ -124,7 +125,7 @@ import { appConfig, databaseConfig } from "./config/app.config";
       }),
     }),
     AuthModule, UsersModule, FairsModule, RidesModule, TicketsModule,
-    BookingsModule, PaymentsModule, StaffModule, AnalyticsModule, HealthModule,
+    BookingsModule, EventsModule, PaymentsModule, StaffModule, AnalyticsModule, HealthModule,
     RealtimeModule, NotificationsModule, PartitionMaintenanceModule,
   ],
 })
