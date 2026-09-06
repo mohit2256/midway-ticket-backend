@@ -25,7 +25,7 @@ import { v4 as uuidv4 } from "uuid";
 import * as QRCode from "qrcode";
 import {
   TicketEntity, TicketStatus, PaymentStatus, PaymentMethod,
-  StaffEntity, ScanLogEntity, ScanOutcome, RideEntity, NotificationType,
+  StaffEntity, ScanLogEntity, ScanOutcome, RideEntity, EventEntity, NotificationType,
 } from "../entities";
 import { IsString, IsUUID } from "class-validator";
 import { ApiProperty } from "@nestjs/swagger";
@@ -35,7 +35,7 @@ import {
 import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { JwtAuthGuard, RolesGuard, Roles, CurrentUser, ScannerRideGuard } from "../../common/guards/auth.guards";
+import { JwtAuthGuard, RolesGuard, Roles, CurrentUser, ScannerRideGuard, ScannerEventGuard } from "../../common/guards/auth.guards";
 import { UserRole } from "../entities";
 import { RealtimeGateway } from "../realtime/realtime.gateway";
 import { NotificationsService } from "../notifications/notifications.module";
@@ -50,6 +50,21 @@ class RedeemTicketDto {
   @ApiProperty({ description: "Ride ID this scanner is assigned to" })
   @IsUUID()
   rideId: string;
+
+  @ApiProperty({ description: "Gate label for audit trail" })
+  @IsString()
+  gate: string;
+}
+
+/** Same as RedeemTicketDto, for staff scanning a standalone Event's tickets. */
+class RedeemEventTicketDto {
+  @ApiProperty({ description: "The QR token scanned from the customer's ticket" })
+  @IsString()
+  qrToken: string;
+
+  @ApiProperty({ description: "Event ID this scanner is assigned to" })
+  @IsUUID()
+  eventId: string;
 
   @ApiProperty({ description: "Gate label for audit trail" })
   @IsString()
@@ -109,6 +124,13 @@ export function toTicketDto(ticket: TicketEntity) {
     rideName:             ticket.ride?.name,
     rideEmoji:            ticket.ride?.emoji,
     rideCoverGradient:    ticket.ride?.coverGradient,
+    // A ticket is for a ride+fair OR a standalone Event, never both — these
+    // are only populated when `ticket.event` was loaded (see EventsService).
+    eventId:              ticket.event?.id,
+    eventName:            ticket.event?.name,
+    eventVenue:           ticket.event?.venue,
+    eventEmoji:           ticket.event?.emoji,
+    eventCoverGradient:   ticket.event?.coverGradient,
     customerId:           ticket.customer?.id,
     customerName:         ticket.customer?.name,
     customerEmail:        ticket.customer?.email,
@@ -140,6 +162,7 @@ export class TicketsService {
     @InjectRepository(StaffEntity)  private readonly staff:   Repository<StaffEntity>,
     @InjectRepository(ScanLogEntity) private readonly scanLogs: Repository<ScanLogEntity>,
     @InjectRepository(RideEntity)   private readonly rides:   Repository<RideEntity>,
+    @InjectRepository(EventEntity)  private readonly events:  Repository<EventEntity>,
     @InjectDataSource()             private readonly db:      DataSource,
     @Inject(CACHE_MANAGER)          private readonly cache:   Cache,
     private readonly realtime:      RealtimeGateway,
@@ -231,6 +254,43 @@ export class TicketsService {
     }
     // Unreachable — the loop above always returns or throws — but keeps
     // TypeScript's control-flow analysis happy about the return type.
+    throw new ConflictException("Could not process this scan. Please try again.");
+  }
+
+  /** Same as redeem() above, for staff scanning a standalone Event's tickets. */
+  async redeemEvent(staffId: string, dto: RedeemEventTicketDto): Promise<RedeemResult> {
+    const { qrToken, eventId, gate } = dto;
+
+    const cachedUsed = await this.cache.get<string>(`${this.USED_KEY}${qrToken}`);
+    if (cachedUsed) {
+      await this.logScan(staffId, null, qrToken, ScanOutcome.ALREADY_USED, gate);
+      const info = JSON.parse(cachedUsed);
+      return {
+        outcome: ScanOutcome.ALREADY_USED,
+        message: "This ticket has already been redeemed.",
+        redeemedAt:          info.redeemedAt,
+        redeemedByStaffName: info.staffName,
+        redeemedAtGate:      info.gate,
+      };
+    }
+
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.redeemEventInTransaction(staffId, qrToken, eventId, gate);
+      } catch (err: any) {
+        const isLockConflict = err?.code === "55P03";
+        if (!isLockConflict || attempt === maxAttempts) {
+          if (isLockConflict) {
+            throw new ConflictException(
+              "This ticket is being scanned by another device right now. Please try again in a moment.",
+            );
+          }
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 75 * attempt));
+      }
+    }
     throw new ConflictException("Could not process this scan. Please try again.");
   }
 
@@ -372,6 +432,117 @@ export class TicketsService {
     });
   }
 
+  /** Same as redeemInTransaction() above, for a standalone Event's tickets. */
+  private async redeemEventInTransaction(
+    staffId: string,
+    qrToken: string,
+    eventId: string,
+    gate:    string,
+  ): Promise<RedeemResult> {
+    return this.db.transaction(async (em) => {
+      const ticket = await em
+        .getRepository(TicketEntity)
+        .createQueryBuilder("t")
+        .setLock("pessimistic_write_or_fail")
+        .leftJoinAndSelect("t.event", "e")
+        .leftJoinAndSelect("t.customer", "c")
+        .leftJoinAndSelect("t.redeemedByStaff", "rs")
+        .leftJoinAndSelect("rs.user", "rsu")
+        .where("t.qrToken = :qrToken", { qrToken })
+        .getOne();
+
+      if (!ticket) {
+        await this.logScan(staffId, null, qrToken, ScanOutcome.INVALID, gate);
+        return { outcome: ScanOutcome.INVALID, message: "Invalid QR code. Not a MidwayTicket." };
+      }
+
+      if (ticket.paymentStatus !== PaymentStatus.PAID) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.INVALID, gate);
+        return { outcome: ScanOutcome.INVALID, message: "Payment not confirmed for this ticket." };
+      }
+
+      const today = new Date().toISOString().split("T")[0];
+      if (ticket.eventDate < today) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.EXPIRED, gate);
+        return { outcome: ScanOutcome.EXPIRED, message: "This ticket has expired." };
+      }
+
+      if (ticket.ticketStatus === TicketStatus.USED) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.ALREADY_USED, gate);
+        return {
+          outcome: ScanOutcome.ALREADY_USED,
+          message: "This ticket was already redeemed.",
+          redeemedAt:          ticket.redeemedAt,
+          redeemedByStaffName: ticket.redeemedByStaff?.user?.name ?? "Staff",
+          redeemedAtGate:      ticket.redeemedAtGate,
+        };
+      }
+
+      // ── Event mismatch check (critical security check) ───────────────────
+      if (!ticket.event || ticket.event.id !== eventId) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.WRONG_RIDE, gate);
+        return {
+          outcome:       ScanOutcome.WRONG_RIDE,
+          message:       ticket.event
+            ? `This ticket is valid for ${ticket.event.name}, not your assigned event.`
+            : "This ticket isn't valid for an event scan.",
+          actualRideName: ticket.event?.name,
+        };
+      }
+
+      const staffMember = await em.getRepository(StaffEntity).findOne({
+        where: { id: staffId },
+        relations: ["user"],
+      });
+
+      ticket.ticketStatus    = TicketStatus.USED;
+      ticket.redeemedAt      = new Date();
+      ticket.redeemedByStaff = staffMember!;
+      ticket.redeemedAtGate  = gate;
+      await em.save(ticket);
+
+      if (staffMember) {
+        staffMember.scansToday++;
+        staffMember.scansTotal++;
+        staffMember.lastScanAt = new Date();
+        await em.save(staffMember);
+      }
+
+      await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.VALID, gate);
+
+      await this.cache.set(
+        `${this.USED_KEY}${qrToken}`,
+        JSON.stringify({
+          redeemedAt: ticket.redeemedAt,
+          staffName:  staffMember?.user?.name ?? "Staff",
+          gate,
+        }),
+        this.USED_TTL,
+      );
+
+      // Realtime dashboard push + notification enqueue are intentionally
+      // skipped here (unlike the ride path) — both are keyed by fair room /
+      // fairId today, and standalone Events have neither. The redeem itself
+      // (the part that matters for correctness) is already committed above
+      // regardless.
+
+      return {
+        outcome: ScanOutcome.VALID,
+        message: "Ticket validated. Entry granted.",
+        ticket: {
+          id:            ticket.id,
+          displayId:     ticket.displayId,
+          quantity:      ticket.quantity,
+          customerName:  ticket.customer?.name,
+          rideName:      ticket.event?.name,
+          eventDate:     ticket.eventDate,
+          paymentMethod: ticket.paymentMethod,
+          totalAmount:   ticket.totalAmount,
+        },
+      };
+    });
+  }
+
   private async logScan(
     staffId: string,
     ticketId: string | null,
@@ -423,12 +594,20 @@ class TicketsController {
   redeem(@Body() dto: RedeemTicketDto, @CurrentUser("staffId") staffId: string) {
     return this.svc.redeem(staffId, dto);
   }
+
+  @Post("redeem-event")
+  @Roles(UserRole.SCANNER_STAFF)
+  @UseGuards(RolesGuard, ScannerEventGuard)
+  @ApiOperation({ summary: "Redeem (scan) a standalone Event's ticket — SCANNER_STAFF only" })
+  redeemEvent(@Body() dto: RedeemEventTicketDto, @CurrentUser("staffId") staffId: string) {
+    return this.svc.redeemEvent(staffId, dto);
+  }
 }
 
 // ── Module ────────────────────────────────────────────────────────────────────
 @Module({
   imports: [
-    TypeOrmModule.forFeature([TicketEntity, StaffEntity, ScanLogEntity, RideEntity]),
+    TypeOrmModule.forFeature([TicketEntity, StaffEntity, ScanLogEntity, RideEntity, EventEntity]),
     NotificationsModule,
   ],
   controllers: [TicketsController],
