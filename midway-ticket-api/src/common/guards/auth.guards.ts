@@ -7,6 +7,9 @@ export interface JwtPayload {
   staffId?:       string;
   assignedRideId?: string;
   assignedFairId?: string;
+  // Set instead of assignedRideId/assignedFairId when this staff member is
+  // assigned to a standalone Event rather than a Fair's ride.
+  assignedEventId?: string;
 }
 
 // ── JWT Strategy ──────────────────────────────────────────────────────────────
@@ -92,6 +95,25 @@ export class ScannerRideGuard implements CanActivate {
     // The staff member is only allowed to POST to /staff/scan — body.rideId must match token
     if (req.body?.rideId && req.body.rideId !== user.assignedRideId) {
       throw new ForbiddenException("You can only scan tickets for your assigned ride");
+    }
+    return true;
+  }
+}
+
+/**
+ * Same idea as ScannerRideGuard, for staff assigned to a standalone Event
+ * instead of a Fair's ride (see EventEntity / StaffEntity.assignedEvent).
+ */
+@Injectable()
+export class ScannerEventGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req  = ctx.switchToHttp().getRequest();
+    const user = req.user;
+    if (!user?.assignedEventId) {
+      throw new ForbiddenException("No event assignment found in token");
+    }
+    if (req.body?.eventId && req.body.eventId !== user.assignedEventId) {
+      throw new ForbiddenException("You can only scan tickets for your assigned event");
     }
     return true;
   }
