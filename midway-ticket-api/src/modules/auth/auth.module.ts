@@ -112,12 +112,28 @@ export class AuthService {
   async loginStaff(dto: LoginDto) {
     const user = await this.loginWithRole(dto, [UserRole.SCANNER_STAFF]);
 
-    // Load staff assignment
+    // Load staff assignment — either a Fair's ride, or a standalone Event.
     const staffMember = await this.staff.findOne({
       where: { user: { id: user.userId }, isActive: true },
-      relations: ["assignedRide", "fair", "operator"],
+      relations: ["assignedRide", "fair", "assignedEvent", "operator"],
     });
     if (!staffMember) throw new UnauthorizedException("No active staff assignment found");
+
+    if (staffMember.assignedEvent) {
+      const payload: JwtPayload = {
+        sub:             user.userId,
+        email:           user.email,
+        role:            UserRole.SCANNER_STAFF,
+        staffId:         staffMember.id,
+        assignedEventId: staffMember.assignedEvent.id,
+      };
+      return {
+        accessToken:   this.jwtService.sign(payload, { expiresIn: "12h" }),
+        staffId:       staffMember.id,
+        assignedEvent: { id: staffMember.assignedEvent.id, name: staffMember.assignedEvent.name },
+        gate:          staffMember.gate,
+      };
+    }
 
     // Issue a token that includes the ride assignment
     const payload: JwtPayload = {
