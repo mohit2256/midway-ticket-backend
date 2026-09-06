@@ -114,6 +114,9 @@ export class OperatorEntity {
   @OneToMany(() => FairEntity, (f) => f.operator)
   fairs: FairEntity[];
 
+  @OneToMany(() => EventEntity, (e) => e.operator)
+  events: EventEntity[];
+
   @OneToMany(() => StaffEntity, (s) => s.operator)
   staff: Relation<StaffEntity[]>;
 
@@ -178,6 +181,84 @@ export class FairEntity {
 
   @OneToMany(() => RideEntity, (r) => r.fair)
   rides: RideEntity[];
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @UpdateDateColumn()
+  updatedAt: Date;
+}
+
+// ── EVENT ─────────────────────────────────────────────────────────────────────
+// A standalone event an operator hosts directly — NOT under a Fair and NOT
+// broken into Rides. e.g. a college auditorium show, a standalone concert, a
+// single-venue ticketed gathering. Kept as its own top-level entity (rather
+// than shoehorned into Fair/Ride) since it has none of a fair's multi-ride
+// structure — just one thing, one price, one capacity.
+
+export enum EventStatus { DRAFT = "DRAFT", ACTIVE = "ACTIVE", ENDED = "ENDED" }
+
+@Entity("events")
+export class EventEntity {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column()
+  name: string;
+
+  @Column({ type: "text", nullable: true })
+  description: string;
+
+  @Column()
+  venue: string;
+
+  @Column()
+  city: string;
+
+  @Column({ type: "date" })
+  eventDate: string;
+
+  @Column({ nullable: true })
+  coverImageUrl: string;
+
+  @Column({ nullable: true })
+  coverGradient: string;
+
+  @Column({ nullable: true })
+  emoji: string;
+
+  @Column({ type: "int", default: 100 })
+  capacity: number;
+
+  @Column({ type: "decimal", precision: 10, scale: 2, default: 0, transformer: decimalTransformer })
+  pricePerTicket: number;
+
+  /**
+   * The operator's own choice, per event: if false, no payment method is
+   * ever presented to a customer booking this event and the ticket is
+   * issued immediately, free — this is the whole point of Events existing
+   * separately from paid Rides. If true (and payments are globally enabled
+   * on this deployment), booking goes through the same Razorpay order/verify
+   * flow as a ride booking.
+   */
+  @Column({ default: false })
+  requiresPayment: boolean;
+
+  @Column({ type: "enum", enum: EventStatus, default: EventStatus.DRAFT })
+  status: EventStatus;
+
+  @ManyToOne(() => OperatorEntity, (o) => o.events)
+  @JoinColumn()
+  operator: OperatorEntity;
+
+  @RelationId((event: EventEntity) => event.operator)
+  operatorId: string;
+
+  @OneToMany(() => TicketEntity, (t) => t.event)
+  tickets: TicketEntity[];
+
+  @OneToMany(() => StaffEntity, (s) => s.assignedEvent)
+  assignedStaff: Relation<StaffEntity[]>;
 
   @CreateDateColumn()
   createdAt: Date;
@@ -325,13 +406,23 @@ export class TicketEntity {
   @JoinColumn()
   customer: UserEntity;
 
-  @ManyToOne(() => RideEntity, (r) => r.tickets)
+  @ManyToOne(() => RideEntity, (r) => r.tickets, { nullable: true })
   @JoinColumn()
   ride: RideEntity;
 
-  @ManyToOne(() => FairEntity)
+  @ManyToOne(() => FairEntity, { nullable: true })
   @JoinColumn()
   fair: FairEntity;
+
+  // Set instead of ride/fair when this ticket is for a standalone Event
+  // booking (see EventEntity) — a ticket is for a ride+fair OR an event,
+  // never both.
+  @ManyToOne(() => EventEntity, (e) => e.tickets, { nullable: true })
+  @JoinColumn()
+  event: EventEntity;
+
+  @RelationId((ticket: TicketEntity) => ticket.event)
+  eventId: string;
 
   @ManyToOne(() => PaymentEntity, { nullable: true })
   @JoinColumn()
@@ -388,6 +479,12 @@ export class PaymentEntity {
   @JoinColumn()
   ride: RideEntity;
 
+  // Only set for a standalone Event booking (see EventEntity) — mutually
+  // exclusive with `ride` above; a payment is for one or the other.
+  @ManyToOne(() => EventEntity, { nullable: true })
+  @JoinColumn()
+  event: EventEntity;
+
   @CreateDateColumn()
   createdAt: Date;
 
@@ -427,17 +524,24 @@ export class StaffEntity {
   @JoinColumn()
   operator: OperatorEntity;
 
-  @ManyToOne(() => FairEntity)
+  @ManyToOne(() => FairEntity, { nullable: true })
   @JoinColumn()
   fair: FairEntity;
 
   /**
    * The ONLY ride this staff member can scan.
    * Backend enforces: if ticket.rideId !== staff.assignedRide.id → WRONG_RIDE
+   * Nullable: a staff member is assigned to EITHER a ride (fair-based) OR a
+   * standalone event (assignedEvent below), never both.
    */
-  @ManyToOne(() => RideEntity, (r) => r.assignedStaff)
+  @ManyToOne(() => RideEntity, (r) => r.assignedStaff, { nullable: true })
   @JoinColumn()
   assignedRide: RideEntity;
+
+  /** The ONLY standalone event this staff member can scan (see EventEntity). */
+  @ManyToOne(() => EventEntity, (e) => e.assignedStaff, { nullable: true })
+  @JoinColumn()
+  assignedEvent: EventEntity;
 
   @OneToMany(() => ScanLogEntity, (sl) => sl.staff)
   scanLogs: ScanLogEntity[];
