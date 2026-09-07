@@ -11,7 +11,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
-import { TicketEntity, RideEntity, FairEntity, OperatorEntity, PaymentStatus } from "../entities";
+import { TicketEntity, RideEntity, FairEntity, EventEntity, OperatorEntity, PaymentStatus } from "../entities";
 import { JwtAuthGuard, RolesGuard, Roles, CurrentUser } from "../../common/guards/auth.guards";
 import { UserRole } from "../entities";
 
@@ -59,13 +59,20 @@ export class AnalyticsService {
     const todayStats = await this.tickets
       .createQueryBuilder("t")
       .leftJoin("t.fair", "f")
-      .leftJoin("f.operator", "o")
+      .leftJoin("t.event", "e")
       .select([
         "COUNT(t.id)           AS ticketCount",
         "SUM(t.totalAmount)    AS revenue",
         "SUM(t.quantity)       AS visitors",
       ])
-      .where("o.id = :operatorId", { operatorId })
+      // FIX: this used to join all the way to "operators" through the fair
+      // only (`.leftJoin("f.operator","o")` + `WHERE o.id = :operatorId`) —
+      // a ticket booked for a standalone Event (see EventEntity) has no
+      // `fair` at all, so every one of this operator's Event tickets was
+      // silently excluded from every number on this dashboard. Comparing
+      // directly against the FK columns already sitting on the joined
+      // fair/event rows covers both cases without an extra join.
+      .where("(f.\"operatorId\" = :operatorId OR e.\"operatorId\" = :operatorId)", { operatorId })
       .andWhere("t.paymentStatus = :paid",  { paid: PaymentStatus.PAID })
       .andWhere("DATE(t.createdAt) = :today", { today })
       .getRawOne();
@@ -73,22 +80,24 @@ export class AnalyticsService {
     const yesterday = new Date(Date.now() - 86_400_000).toISOString().split("T")[0];
     const yStats = await this.tickets
       .createQueryBuilder("t")
-      .leftJoin("t.fair", "f").leftJoin("f.operator", "o")
+      .leftJoin("t.fair", "f")
+      .leftJoin("t.event", "e")
       .select(["SUM(t.totalAmount) AS revenue", "COUNT(t.id) AS ticketCount"])
-      .where("o.id = :operatorId", { operatorId })
+      .where("(f.\"operatorId\" = :operatorId OR e.\"operatorId\" = :operatorId)", { operatorId })
       .andWhere("t.paymentStatus = :paid", { paid: PaymentStatus.PAID })
       .andWhere("DATE(t.createdAt) = :yesterday", { yesterday })
       .getRawOne();
 
     const hourly = await this.tickets
       .createQueryBuilder("t")
-      .leftJoin("t.fair", "f").leftJoin("f.operator", "o")
+      .leftJoin("t.fair", "f")
+      .leftJoin("t.event", "e")
       .select([
         "EXTRACT(HOUR FROM t.createdAt AT TIME ZONE 'Asia/Kolkata') AS hour",
         "COUNT(t.id)        AS tickets",
         "SUM(t.totalAmount) AS revenue",
       ])
-      .where("o.id = :operatorId", { operatorId })
+      .where("(f.\"operatorId\" = :operatorId OR e.\"operatorId\" = :operatorId)", { operatorId })
       .andWhere("t.paymentStatus = :paid", { paid: PaymentStatus.PAID })
       .andWhere("DATE(t.createdAt) = :today", { today })
       .groupBy("hour")
@@ -132,8 +141,9 @@ export class AnalyticsService {
       .createQueryBuilder("t")
       .leftJoinAndSelect("t.customer", "customer")
       .leftJoinAndSelect("t.ride", "ride")
-      .leftJoin("t.fair", "f").leftJoin("f.operator", "o")
-      .where("o.id = :operatorId", { operatorId })
+      .leftJoinAndSelect("t.event", "event")
+      .leftJoin("t.fair", "f")
+      .where("(f.\"operatorId\" = :operatorId OR event.\"operatorId\" = :operatorId)", { operatorId })
       .orderBy("t.createdAt", "DESC")
       .limit(10)
       .getMany();
@@ -144,12 +154,20 @@ export class AnalyticsService {
     // customer/ride objects back to a consumer expecting flat fields.
     const recentTickets = recentTicketRows.map((t) => ({
       id:            t.id,
-      fairId:        t.fair?.id ?? "",
-      fairName:      t.fair?.name ?? "",
-      rideId:        t.ride?.id ?? "",
-      rideName:      t.ride?.name ?? "",
-      rideEmoji:     t.ride?.emoji ?? "",
-      rideCoverGradient: t.ride?.coverGradient ?? "",
+      fairId:        t.fair?.id,
+      fairName:      t.fair?.name,
+      rideId:        t.ride?.id,
+      rideName:      t.ride?.name,
+      rideEmoji:     t.ride?.emoji,
+      rideCoverGradient: t.ride?.coverGradient,
+      // Only set for a standalone Event ticket (see EventEntity) — this
+      // list used to only ever show ride/fair tickets, silently dropping
+      // every Event booking from "Recent Transactions".
+      eventId:            t.event?.id,
+      eventName:          t.event?.name,
+      eventVenue:         t.event?.venue,
+      eventEmoji:         t.event?.emoji,
+      eventCoverGradient: t.event?.coverGradient,
       customerId:    t.customer?.id ?? "",
       customerName:  t.customer?.name ?? "",
       customerEmail: t.customer?.email ?? "",
@@ -207,9 +225,10 @@ export class AnalyticsService {
       days.map(async (day) => {
         const row = await this.tickets
           .createQueryBuilder("t")
-          .leftJoin("t.fair", "f").leftJoin("f.operator", "o")
+          .leftJoin("t.fair", "f")
+          .leftJoin("t.event", "e")
           .select(["COUNT(t.id) AS tickets", "SUM(t.totalAmount) AS revenue"])
-          .where("o.id = :operatorId", { operatorId })
+          .where("(f.\"operatorId\" = :operatorId OR e.\"operatorId\" = :operatorId)", { operatorId })
           .andWhere("t.paymentStatus = :paid", { paid: PaymentStatus.PAID })
           .andWhere("DATE(t.createdAt) = :day", { day })
           .getRawOne();
@@ -266,7 +285,7 @@ export class AnalyticsController {
 // ── Module ────────────────────────────────────────────────────────────────────
 
 @Module({
-  imports:     [TypeOrmModule.forFeature([TicketEntity, RideEntity, FairEntity, OperatorEntity])],
+  imports:     [TypeOrmModule.forFeature([TicketEntity, RideEntity, FairEntity, EventEntity, OperatorEntity])],
   controllers: [AnalyticsController],
   providers:   [AnalyticsService],
   exports:     [AnalyticsService],
