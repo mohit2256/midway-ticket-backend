@@ -6,7 +6,7 @@ import { EmailProcessor } from "./email.processor";
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {
-  Injectable, NotFoundException, BadRequestException, Logger,
+  Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository, DataSource } from "typeorm";
@@ -33,7 +33,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import { BullModule } from "@nestjs/bullmq";
 
 import {
-  TicketEntity, PaymentEntity, RideEntity, FairEntity,
+  TicketEntity, PaymentEntity, RideEntity, FairEntity, OperatorEntity,
   UserEntity, TicketStatus, PaymentStatus, PaymentMethod, NotificationType,
 } from "../entities";
 import { JwtAuthGuard, CurrentUser, Roles, RolesGuard } from "../../common/guards/auth.guards";
@@ -59,6 +59,26 @@ export class VerifyPaymentDto {
   @ApiProperty() @IsString() razorpaySignature:  string;
 }
 
+/**
+ * Operator-only "issue a ticket without payment" tool. Completely separate
+ * from the customer checkout flow (CreateBookingDto above) — there is no
+ * payment method field here at all, on purpose: for this action a payment
+ * option should never be shown or accepted, full stop. Meant for an
+ * organizer to generate a real ticket + QR for their own ride to test that
+ * the QR renders and scans correctly at the gate, without needing a real
+ * paying customer or Razorpay wired up.
+ */
+export class IssueTestTicketDto {
+  @ApiProperty() @IsUUID() rideId: string;
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional() @IsInt() @Min(1) @Max(10) @Type(() => Number)
+  quantity?: number;
+  // Leave blank to issue the ticket to your own (operator) account — the
+  // simplest path for a quick QR/scanner test. Provide an email only if you
+  // want the test ticket attached to a specific existing customer account.
+  @ApiPropertyOptional() @IsOptional() @IsEmail() customerEmail?: string;
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 import { Inject } from "@nestjs/common";
@@ -82,6 +102,7 @@ export class BookingsService {
     @InjectRepository(RideEntity)    private rides:    Repository<RideEntity>,
     @InjectRepository(FairEntity)    private fairs:    Repository<FairEntity>,
     @InjectRepository(UserEntity)    private users:    Repository<UserEntity>,
+    @InjectRepository(OperatorEntity) private operators: Repository<OperatorEntity>,
     @InjectDataSource()              private db:       DataSource,
     @InjectQueue("email")            private emailQ:   Queue,
     private readonly config:         ConfigService,
@@ -319,6 +340,47 @@ export class BookingsService {
 
       return { ticket, paymentId: payment.id };
     });
+  }
+
+  /**
+   * Operator-only: issue a real ticket for one of *their own* rides without
+   * any payment step at all — for testing that QR generation and gate
+   * scanning actually work end-to-end, without needing a real paying
+   * customer or Razorpay wired up.
+   *
+   * Reuses the exact same seat-locking + issuance path as a normal free
+   * booking (`issueFreeTicket`), just with `totalAmount` forced to 0 (so it
+   * never shows up as revenue) and an ownership check first (an operator
+   * can only issue test tickets for rides under their own fairs).
+   */
+  async issueTestTicket(userId: string, dto: IssueTestTicketDto) {
+    const operator = await this.operators.findOne({ where: { owner: { id: userId } } });
+    if (!operator) throw new ForbiddenException("No operator account found for this user");
+
+    const ride = await this.rides.findOne({
+      where: { id: dto.rideId },
+      relations: ["fair", "fair.operator"],
+    });
+    if (!ride) throw new NotFoundException("Ride not found");
+    if (ride.fair?.operator?.id !== operator.id) {
+      throw new ForbiddenException("This ride doesn't belong to your account");
+    }
+
+    // Default: issue to the operator's own account — the fastest path to a
+    // scannable QR for testing. An email only needs to be passed if the
+    // ticket should be attached to a specific existing customer instead.
+    let targetUserId = userId;
+    if (dto.customerEmail) {
+      const customer = await this.users.findOne({ where: { email: dto.customerEmail } });
+      if (!customer) {
+        throw new NotFoundException(
+          "No account found with that email. Leave it blank to issue the test ticket to your own account instead.",
+        );
+      }
+      targetUserId = customer.id;
+    }
+
+    return this.issueFreeTicket(targetUserId, ride, dto.quantity ?? 1, 0);
   }
 
   /** Step 2: Verify Razorpay signature and issue the ticket (payments-mode only) */
@@ -569,6 +631,17 @@ export class BookingsController {
     return this.svc.verifyAndIssueTicket(userId, dto);
   }
 
+  @Post("operator/issue-test-ticket")
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.OPERATOR_OWNER, UserRole.OPERATOR_MANAGER)
+  @ApiOperation({
+    summary: "Operator-only: issue a ticket without payment, for QR/scanner testing",
+  })
+  issueTestTicket(@Body() dto: IssueTestTicketDto, @CurrentUser("sub") userId: string) {
+    return this.svc.issueTestTicket(userId, dto);
+  }
+
   @Post("webhook")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "[Payments mode only] Razorpay webhook endpoint (no auth)" })
@@ -584,7 +657,7 @@ export class BookingsController {
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([TicketEntity, PaymentEntity, RideEntity, FairEntity, UserEntity]),
+    TypeOrmModule.forFeature([TicketEntity, PaymentEntity, RideEntity, FairEntity, UserEntity, OperatorEntity]),
     BullModule.registerQueue({ name: "email" }),
     NotificationsModule,
   ],
