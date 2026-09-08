@@ -34,6 +34,7 @@ export class AnalyticsService {
     @InjectRepository(TicketEntity)   private tickets:   Repository<TicketEntity>,
     @InjectRepository(RideEntity)     private rides:     Repository<RideEntity>,
     @InjectRepository(FairEntity)     private fairs:     Repository<FairEntity>,
+    @InjectRepository(EventEntity)    private events:    Repository<EventEntity>,
     @InjectRepository(OperatorEntity) private operators: Repository<OperatorEntity>,
     @Inject(CACHE_MANAGER)            private cache:     Cache,
   ) {}
@@ -50,7 +51,11 @@ export class AnalyticsService {
   }
 
   async getDashboard(operatorId: string) {
-    const cacheKey = `analytics:dashboard:v2:${operatorId}`;
+    // v3: added activeEventsCount + upcomingEvents (see fix below) — same
+    // reasoning as the v2 bump documented above: a stale cached response
+    // from before this fix would silently omit the new fields for up to
+    // CACHE_TTL after deploy.
+    const cacheKey = `analytics:dashboard:v3:${operatorId}`;
     const cached   = await this.cache.get(cacheKey);
     if (cached) return cached;
 
@@ -129,6 +134,29 @@ export class AnalyticsService {
       .andWhere("r.status = 'Active'")
       .getCount();
 
+    // FIX: EventEntity was already imported and registered in this module's
+    // TypeOrmModule.forFeature() — someone clearly started wiring Events
+    // into the dashboard — but the repository was never actually injected
+    // and this query never written. That's the whole reason the operator
+    // dashboard had no Events section at all: the data it would need was
+    // never being fetched, so there was nothing for a UI section to show.
+    // Mirrors the exact ride/fair ownership pattern above, just for events.
+    const upcomingEventRows = await this.events
+      .createQueryBuilder("e")
+      .where("e.operatorId = :operatorId", { operatorId })
+      .andWhere("e.status = 'ACTIVE'")
+      .andWhere("e.eventDate >= :today", { today })
+      .orderBy("e.eventDate", "ASC")
+      .limit(5)
+      .getMany();
+
+    const activeEventsCount = await this.events
+      .createQueryBuilder("e")
+      .where("e.operatorId = :operatorId", { operatorId })
+      .andWhere("e.status = 'ACTIVE'")
+      .andWhere("e.eventDate >= :today", { today })
+      .getCount();
+
     // Both of these were previously missing from this response entirely,
     // even though the frontend's OperatorDashboardData type requires them —
     // that mismatch is what crashed the dashboard page (data!.recentTickets
@@ -198,6 +226,16 @@ export class AnalyticsService {
       visitorsToday:      Number(todayStats?.visitors)    || 0,
       visitorsChange:     Math.round(ticketChange * 10)   / 10,
       activeRides,
+      activeEventsCount,
+      upcomingEvents: upcomingEventRows.map((e) => ({
+        id:            e.id,
+        name:          e.name,
+        venue:         e.venue,
+        eventDate:     e.eventDate,
+        emoji:         e.emoji,
+        coverGradient: e.coverGradient,
+        capacity:      e.capacity,
+      })),
       hourlyData:      this.formatHourly(hourly),
       weeklyData,
       ridePerformance: ridePerf.map((r) => ({
