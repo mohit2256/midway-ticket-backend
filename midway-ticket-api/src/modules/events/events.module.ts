@@ -163,6 +163,17 @@ export class EventsService {
       ...dto,
       pricePerTicket:  dto.pricePerTicket ?? 0,
       requiresPayment: dto.requiresPayment ?? false,
+      // FIX: the entity column defaults status to DRAFT, and there was no
+      // publish action anywhere — no UI button, no separate endpoint — to
+      // ever move an event out of DRAFT afterwards. findAll() (public
+      // listing) only returns status = ACTIVE, so every event created
+      // through this form was permanently invisible to customers from the
+      // moment it was created, with no way to fix it after the fact.
+      // Fairs and Rides elsewhere in this app go live immediately on
+      // creation with no moderation step, so Events does the same here for
+      // consistency — an operator finishing this form expects it to be
+      // live, the same way finishing "New Ride" makes a ride bookable.
+      status: EventStatus.ACTIVE,
       operator,
     });
     return this.events.save(event);
