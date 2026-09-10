@@ -61,6 +61,34 @@ export class UserEntity {
   @Column({ default: true })
   isActive: boolean;
 
+  // ── Email verification ──────────────────────────────────────────────────
+  @Column({ default: false })
+  emailVerified: boolean;
+
+  // Hashed (SHA-256), never the raw token — same reasoning as passwordHash:
+  // a DB dump should never hand out usable tokens. select:false so it's
+  // never returned by a plain find()/findOne() by accident.
+  @Column({ nullable: true, select: false })
+  emailVerificationTokenHash: string;
+
+  @Column({ type: "timestamptz", nullable: true })
+  emailVerificationExpiresAt: Date;
+
+  // ── Password reset ───────────────────────────────────────────────────────
+  @Column({ nullable: true, select: false })
+  passwordResetTokenHash: string;
+
+  @Column({ type: "timestamptz", nullable: true })
+  passwordResetExpiresAt: Date;
+
+  // Set every time the password changes (registration doesn't count — only
+  // an actual reset/change). JwtStrategy compares this against the token's
+  // `iat` claim so that any JWT issued BEFORE a password reset stops working
+  // immediately, instead of staying valid until its natural 7-day expiry —
+  // closing the "leaked old token still works after reset" gap.
+  @Column({ type: "timestamptz", nullable: true })
+  passwordChangedAt: Date;
+
   @CreateDateColumn()
   createdAt: Date;
 
