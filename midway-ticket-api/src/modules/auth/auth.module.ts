@@ -28,22 +28,54 @@ export class LoginDto {
   @ApiProperty() @IsString() password: string;
 }
 
+export class VerifyEmailDto {
+  @ApiProperty() @IsString() token: string;
+}
+
+export class ResendVerificationDto {
+  @ApiProperty() @IsEmail() email: string;
+}
+
+export class ForgotPasswordDto {
+  @ApiProperty() @IsEmail() email: string;
+}
+
+export class ResetPasswordDto {
+  @ApiProperty() @IsString() token: string;
+  @ApiProperty() @IsString() @MinLength(8) newPassword: string;
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
-import { Injectable, ConflictException, UnauthorizedException } from "@nestjs/common";
+import { Injectable, ConflictException, UnauthorizedException, BadRequestException, Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { JwtService } from "@nestjs/jwt";
 import { ConfigService } from "@nestjs/config";
+import { InjectQueue } from "@nestjs/bullmq";
+import { Queue } from "bullmq";
 import * as bcrypt from "bcrypt";
+import * as crypto from "crypto";
 import { UserEntity, StaffEntity, OperatorEntity } from "../entities";
 import type { JwtPayload } from "../../common/guards/auth.guards";
 
+// How long a verification/reset link stays valid before the user has to
+// request a fresh one.
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const RESET_TTL_MS        = 60 * 60 * 1000;      // 1h
+
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     @InjectRepository(UserEntity)     private readonly users:     Repository<UserEntity>,
     @InjectRepository(StaffEntity)    private readonly staff:     Repository<StaffEntity>,
     @InjectRepository(OperatorEntity) private readonly operators: Repository<OperatorEntity>,
+    @InjectQueue("email")             private readonly emailQ:    Queue,
     private readonly jwtService: JwtService,
     private readonly config:     ConfigService,
   ) {}
@@ -60,7 +92,11 @@ export class AuthService {
       role:         UserRole.CUSTOMER,
     });
     await this.users.save(user);
+    await this.sendVerificationEmail(user);
 
+    // Registration still logs the user in immediately — verification is a
+    // background nudge (banner + resend option on the frontend), not a hard
+    // gate, so this doesn't change existing behaviour for anyone.
     return this.issueTokens(user);
   }
 
@@ -89,8 +125,101 @@ export class AuthService {
       owner: user,
     });
     await this.operators.save(operator);
+    await this.sendVerificationEmail(user);
 
     return this.issueTokens(user);
+  }
+
+  // ── Email verification ───────────────────────────────────────────────────
+
+  private async sendVerificationEmail(user: UserEntity) {
+    const token = crypto.randomBytes(32).toString("hex");
+    user.emailVerificationTokenHash  = sha256(token);
+    user.emailVerificationExpiresAt  = new Date(Date.now() + VERIFICATION_TTL_MS);
+    await this.users.save(user);
+
+    const verifyUrl = `${this.config.get("app.frontendUrl")}/verify-email?token=${token}`;
+    await this.emailQ.add("send-verification-email", {
+      email: user.email, name: user.name, verifyUrl,
+    }).catch((err) => this.logger.error("Failed to queue verification email", err));
+  }
+
+  async verifyEmail(dto: VerifyEmailDto) {
+    const tokenHash = sha256(dto.token);
+    const user = await this.users
+      .createQueryBuilder("u")
+      .addSelect("u.emailVerificationTokenHash")
+      .where("u.emailVerificationTokenHash = :tokenHash", { tokenHash })
+      .getOne();
+
+    if (!user || !user.emailVerificationExpiresAt || user.emailVerificationExpiresAt < new Date()) {
+      throw new BadRequestException("This verification link is invalid or has expired. Request a new one.");
+    }
+
+    user.emailVerified = true;
+    user.emailVerificationTokenHash = null as any;
+    user.emailVerificationExpiresAt = null as any;
+    await this.users.save(user);
+
+    return { verified: true };
+  }
+
+  async resendVerification(dto: ResendVerificationDto) {
+    const user = await this.users.findOne({ where: { email: dto.email } });
+    // Deliberately the same response whether or not the account exists, or
+    // is already verified — same user-enumeration reasoning as
+    // forgotPassword() below.
+    if (user && !user.emailVerified) {
+      await this.sendVerificationEmail(user);
+    }
+    return { message: "If that account exists and isn't verified yet, a new verification email has been sent." };
+  }
+
+  // ── Password reset ───────────────────────────────────────────────────────
+
+  async forgotPassword(dto: ForgotPasswordDto) {
+    const user = await this.users.findOne({ where: { email: dto.email } });
+
+    // CRITICAL: always return the exact same response whether or not the
+    // email exists. Returning something different ("email not found" vs
+    // "reset link sent") lets an attacker enumerate every registered email
+    // address on the platform one guess at a time.
+    const genericResponse = { message: "If that email is registered, a password reset link has been sent." };
+    if (!user) return genericResponse;
+
+    const token = crypto.randomBytes(32).toString("hex");
+    user.passwordResetTokenHash = sha256(token);
+    user.passwordResetExpiresAt = new Date(Date.now() + RESET_TTL_MS);
+    await this.users.save(user);
+
+    const resetUrl = `${this.config.get("app.frontendUrl")}/reset-password?token=${token}`;
+    await this.emailQ.add("send-password-reset-email", {
+      email: user.email, name: user.name, resetUrl,
+    }).catch((err) => this.logger.error("Failed to queue password reset email", err));
+
+    return genericResponse;
+  }
+
+  async resetPassword(dto: ResetPasswordDto) {
+    const tokenHash = sha256(dto.token);
+    const user = await this.users
+      .createQueryBuilder("u")
+      .addSelect("u.passwordResetTokenHash")
+      .where("u.passwordResetTokenHash = :tokenHash", { tokenHash })
+      .getOne();
+
+    if (!user || !user.passwordResetExpiresAt || user.passwordResetExpiresAt < new Date()) {
+      throw new BadRequestException("This reset link is invalid or has expired. Request a new one.");
+    }
+
+    user.passwordHash            = await bcrypt.hash(dto.newPassword, 12);
+    user.passwordResetTokenHash  = null as any;
+    user.passwordResetExpiresAt  = null as any;
+    // Kills every JWT issued before this moment — see JwtStrategy.validate().
+    user.passwordChangedAt       = new Date();
+    await this.users.save(user);
+
+    return { message: "Your password has been reset. Please log in with your new password." };
   }
 
   async loginCustomer(dto: LoginDto) {
@@ -198,6 +327,7 @@ export class AuthService {
       role:        user.role,
       operatorId,             // empty string for customers/staff — never null
       operatorName,           // the OperatorEntity's business name, not the owner's personal name
+      emailVerified: user.emailVerified,
     };
   }
 }
@@ -205,6 +335,7 @@ export class AuthService {
 // ── Controller ────────────────────────────────────────────────────────────────
 import { Controller, Post, Body, HttpCode, HttpStatus } from "@nestjs/common";
 import { ApiTags, ApiOperation } from "@nestjs/swagger";
+import { Throttle } from "@nestjs/throttler";
 
 @ApiTags("auth")
 @Controller({ path: "auth", version: "1" })
@@ -243,6 +374,42 @@ export class AuthController {
   loginStaff(@Body() dto: LoginDto) {
     return this.authService.loginStaff(dto);
   }
+
+  @Post("verify-email")
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Verify an account's email address using the token from the verification email" })
+  verifyEmail(@Body() dto: VerifyEmailDto) {
+    return this.authService.verifyEmail(dto);
+  }
+
+  @Post("resend-verification")
+  @HttpCode(HttpStatus.OK)
+  // Tighter than the global default — this endpoint sends an email per
+  // call, so it's a spam/cost vector if left at the general request limit.
+  @Throttle({ default: { ttl: 60_000, limit: 3 } })
+  @ApiOperation({ summary: "Resend the email verification link" })
+  resendVerification(@Body() dto: ResendVerificationDto) {
+    return this.authService.resendVerification(dto);
+  }
+
+  @Post("forgot-password")
+  @HttpCode(HttpStatus.OK)
+  // Same reasoning as resend-verification — this is exactly the kind of
+  // endpoint that gets hammered to spam other people's inboxes or to probe
+  // which emails are registered, so it gets its own tighter limit.
+  @Throttle({ default: { ttl: 60_000, limit: 3 } })
+  @ApiOperation({ summary: "Request a password reset email" })
+  forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.forgotPassword(dto);
+  }
+
+  @Post("reset-password")
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { ttl: 60_000, limit: 5 } })
+  @ApiOperation({ summary: "Reset password using the token from the reset email" })
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto);
+  }
 }
 
 // ── Module ────────────────────────────────────────────────────────────────────
@@ -250,12 +417,14 @@ import { Module } from "@nestjs/common";
 import { PassportModule } from "@nestjs/passport";
 import { JwtModule } from "@nestjs/jwt";
 import { TypeOrmModule } from "@nestjs/typeorm";
+import { BullModule } from "@nestjs/bullmq";
 import { JwtStrategy } from "../../common/guards/auth.guards";
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([UserEntity, StaffEntity, OperatorEntity]),
     PassportModule.register({ defaultStrategy: "jwt" }),
+    BullModule.registerQueue({ name: "email" }),
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (cfg: ConfigService) => ({
