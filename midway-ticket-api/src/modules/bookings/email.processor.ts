@@ -19,6 +19,14 @@ export interface SendTicketJob {
   displayId:  string;
 }
 
+export interface SendVerificationEmailJob {
+  email: string; name: string; verifyUrl: string;
+}
+
+export interface SendPasswordResetEmailJob {
+  email: string; name: string; resetUrl: string;
+}
+
 @Processor("email")
 export class EmailProcessor extends WorkerHost {
   private readonly logger     = new Logger(EmailProcessor.name);
@@ -41,9 +49,71 @@ export class EmailProcessor extends WorkerHost {
 
   async process(job: Job) {
     switch (job.name) {
-      case "send-ticket": return this.sendTicketEmail(job.data as SendTicketJob);
+      case "send-ticket":                 return this.sendTicketEmail(job.data as SendTicketJob);
+      case "send-verification-email":     return this.sendVerificationEmail(job.data as SendVerificationEmailJob);
+      case "send-password-reset-email":   return this.sendPasswordResetEmail(job.data as SendPasswordResetEmailJob);
       default: this.logger.warn(`Unknown job: ${job.name}`);
     }
+  }
+
+  private async sendVerificationEmail({ email, name, verifyUrl }: SendVerificationEmailJob) {
+    await this.transporter.sendMail({
+      from:    this.config.get("app.smtp.from", "tickets@midwayticket.in"),
+      to:      email,
+      subject: "Verify your MidwayTicket email address",
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC;margin:0;padding:20px;">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">
+    <div style="background:linear-gradient(135deg,#0F172A,#1E293B);padding:24px;text-align:center;">
+      <div style="color:#38BDF8;font-size:12px;font-weight:700;letter-spacing:.1em;margin-bottom:4px;">MIDWAYTICKET</div>
+      <div style="color:#fff;font-size:22px;font-weight:700;">Verify your email</div>
+    </div>
+    <div style="padding:24px;">
+      <p style="color:#64748B;font-size:14px;">Hi ${name},<br>Confirm this is really your email address to finish setting up your account.</p>
+      <div style="text-align:center;margin:24px 0;">
+        <a href="${verifyUrl}" style="display:inline-block;background:#0EA5E9;color:#fff;font-weight:600;font-size:14px;padding:12px 28px;border-radius:10px;text-decoration:none;">Verify Email</a>
+      </div>
+      <p style="color:#94A3B8;font-size:12px;">This link expires in 24 hours. If you didn't create a MidwayTicket account, you can ignore this email.</p>
+    </div>
+    <div style="padding:16px 24px;background:#F8FAFC;text-align:center;font-size:11px;color:#94A3B8;">MidwayTicket · support@midwayticket.in</div>
+  </div>
+</body>
+</html>`,
+    });
+    this.logger.log(`Verification email sent → ${email}`);
+  }
+
+  private async sendPasswordResetEmail({ email, name, resetUrl }: SendPasswordResetEmailJob) {
+    await this.transporter.sendMail({
+      from:    this.config.get("app.smtp.from", "tickets@midwayticket.in"),
+      to:      email,
+      subject: "Reset your MidwayTicket password",
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC;margin:0;padding:20px;">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">
+    <div style="background:linear-gradient(135deg,#0F172A,#1E293B);padding:24px;text-align:center;">
+      <div style="color:#38BDF8;font-size:12px;font-weight:700;letter-spacing:.1em;margin-bottom:4px;">MIDWAYTICKET</div>
+      <div style="color:#fff;font-size:22px;font-weight:700;">Reset your password</div>
+    </div>
+    <div style="padding:24px;">
+      <p style="color:#64748B;font-size:14px;">Hi ${name},<br>We received a request to reset your password. Click below to set a new one.</p>
+      <div style="text-align:center;margin:24px 0;">
+        <a href="${resetUrl}" style="display:inline-block;background:#0EA5E9;color:#fff;font-weight:600;font-size:14px;padding:12px 28px;border-radius:10px;text-decoration:none;">Reset Password</a>
+      </div>
+      <p style="color:#94A3B8;font-size:12px;">This link expires in 1 hour. If you didn't request this, your password is still safe — just ignore this email.</p>
+    </div>
+    <div style="padding:16px 24px;background:#F8FAFC;text-align:center;font-size:11px;color:#94A3B8;">MidwayTicket · support@midwayticket.in</div>
+  </div>
+</body>
+</html>`,
+    });
+    this.logger.log(`Password reset email sent → ${email}`);
   }
 
   private async sendTicketEmail({ ticketId, displayId }: SendTicketJob) {
