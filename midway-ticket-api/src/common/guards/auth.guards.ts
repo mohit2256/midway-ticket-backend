@@ -10,6 +10,9 @@ export interface JwtPayload {
   // Set instead of assignedRideId/assignedFairId when this staff member is
   // assigned to a standalone Event rather than a Fair's ride.
   assignedEventId?: string;
+  // Added automatically by jwt.sign() — declared here so JwtStrategy can
+  // compare it against the user's passwordChangedAt without an `any` cast.
+  iat?: number;
 }
 
 // ── JWT Strategy ──────────────────────────────────────────────────────────────
@@ -37,6 +40,19 @@ export class JwtStrategy extends PassportStrategy(Strategy, "jwt") {
   async validate(payload: JwtPayload) {
     const user = await this.users.findOne({ where: { id: payload.sub, isActive: true } });
     if (!user) throw new UnauthorizedException("Invalid or expired token");
+
+    // FIX: a JWT issued before the user's last password reset used to stay
+    // valid until its natural expiry (up to 7 days) — resetting your
+    // password did nothing to a copy of your old token an attacker already
+    // had. Comparing against `iat` (seconds since epoch) closes that gap:
+    // any token signed before the most recent password change is rejected.
+    if (user.passwordChangedAt && payload.iat) {
+      const tokenIssuedAtMs = payload.iat * 1000;
+      if (tokenIssuedAtMs < user.passwordChangedAt.getTime()) {
+        throw new UnauthorizedException("Session expired — please log in again");
+      }
+    }
+
     return { ...user, ...payload };  // attach payload extras (staffId, assignedRideId)
   }
 }
