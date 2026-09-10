@@ -1,7 +1,8 @@
 import { Module } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { ThrottlerModule } from "@nestjs/throttler";
+import { ThrottlerModule, ThrottlerGuard } from "@nestjs/throttler";
 import { CacheModule } from "@nestjs/cache-manager";
 import { BullModule } from "@nestjs/bullmq";
 import { AuthModule }     from "./modules/auth/auth.module";
@@ -127,6 +128,16 @@ import { appConfig, databaseConfig } from "./config/app.config";
     AuthModule, UsersModule, FairsModule, RidesModule, TicketsModule,
     BookingsModule, EventsModule, PaymentsModule, StaffModule, AnalyticsModule, HealthModule,
     RealtimeModule, NotificationsModule, PartitionMaintenanceModule,
+  ],
+  providers: [
+    // FIX: ThrottlerModule was configured (see above) but never actually
+    // enforced anywhere — no guard was registered, so every route, including
+    // login and the new password-reset/email-verification endpoints below,
+    // could be hit at unlimited speed. Registering it globally here is what
+    // actually turns the existing config into real rate limiting. Any
+    // individual route that needs a different limit can still override it
+    // with @Throttle(...) or opt out with @SkipThrottle().
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],
 })
 export class AppModule {}
