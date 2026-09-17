@@ -8,9 +8,8 @@ import { EmailProcessor } from "./email.processor";
 import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger,
 } from "@nestjs/common";
-import { InjectRepository } from "@nestjs/typeorm";
-import { Repository, DataSource } from "typeorm";
-import { InjectDataSource } from "@nestjs/typeorm";
+import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
+import { Repository, DataSource, In } from "typeorm";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 import { ConfigService } from "@nestjs/config";
@@ -305,7 +304,7 @@ export class BookingsService {
       const bookedCount = Number(total);
 
       if (bookedCount + quantity > lockedRide.capacity) {
-        await this.notifications.enqueue({
+        this.notifications.enqueue({
           type:    NotificationType.RIDE_SOLD_OUT,
           fairId:  lockedRide.fair?.id,
           payload: { rideId: lockedRide.id, rideName: lockedRide.name },
@@ -324,21 +323,24 @@ export class BookingsService {
       });
       await em.save(payment);
 
-      const ticket = await this.issueTicket(em, userId, payment, quantity, lockedRide);
+      const tickets = await this.issueTicket(em, userId, payment, quantity, lockedRide);
 
-      await this.emailQ.add("send-ticket", {
+      // FIX: was a single { ticketId, displayId } — now every ticket from
+      // this purchase goes in one email/job so the customer gets one email
+      // with all N QR codes, not N separate emails (or, as before, only
+      // the first/only ticket's QR at all).
+      this.emailQ.add("send-ticket", {
         customerId: userId,
-        ticketId:   ticket.id,
-        displayId:  ticket.displayId,
+        ticketIds:  tickets.map((t) => t.id),
       }).catch(() => {/* email failure should not fail the booking */});
 
-      await this.notifications.enqueue({
+      this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
         recipientUserId: userId,
-        payload: { ticketId: ticket.id, displayId: ticket.displayId },
+        payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { ticket, paymentId: payment.id };
+      return { tickets, paymentId: payment.id };
     });
   }
 
@@ -448,7 +450,7 @@ export class BookingsService {
         // fast so no ticket is issued beyond capacity.
         payment.status = PaymentStatus.FAILED;
         await em.save(payment);
-        await this.notifications.enqueue({
+        this.notifications.enqueue({
           type:    NotificationType.RIDE_SOLD_OUT,
           fairId:  ride.fair?.id,
           payload: { rideId: ride.id, rideName: ride.name },
@@ -464,28 +466,28 @@ export class BookingsService {
       payment.razorpaySignature  = razorpaySignature;
       await em.save(payment);
 
-      const ticket = await this.issueTicket(em, userId, payment, payment.quantity, ride);
+      const tickets = await this.issueTicket(em, userId, payment, payment.quantity, ride);
 
-      // Queue confirmation email (non-blocking)
-      await this.emailQ.add("send-ticket", {
+      // Queue confirmation email (non-blocking) — one email, all N QR codes.
+      this.emailQ.add("send-ticket", {
         customerId: userId,
-        ticketId:   ticket.id,
-        displayId:  ticket.displayId,
+        ticketIds:  tickets.map((t) => t.id),
       }).catch(() => {/* email failure should not fail the booking */});
 
       // In-app + future push/SMS notification — also non-blocking, also
       // outside this DB transaction's concern. Eventual consistency: the
       // customer sees "Ticket Issued" pop up a moment after the response.
-      await this.notifications.enqueue({
+      this.notifications.enqueue({
         type:             NotificationType.TICKET_ISSUED,
         recipientUserId:  userId,
         payload: {
-          ticketId:  ticket.id,
-          displayId: ticket.displayId,
+          ticketId:  tickets[0].id,
+          displayId: tickets[0].displayId,
+          count:     tickets.length,
         },
       });
 
-      return { ticket, paymentId: payment.id };
+      return { tickets, paymentId: payment.id };
     });
   }
 
@@ -544,6 +546,14 @@ export class BookingsService {
     return { received: true };
   }
 
+  /**
+   * Issues `quantity` individually-scannable tickets — one row, one QR
+   * token, per person — instead of a single row carrying a `quantity`
+   * field. That older model meant a group of 5 shared exactly one QR code,
+   * so the gate could only ever redeem "all 5 at once" in a single scan,
+   * and only one QR image existed to show/email in the first place.
+   * Returns an array; every caller now handles N tickets, not one.
+   */
   private async issueTicket(
     em: any,
     userId: string,
@@ -551,39 +561,42 @@ export class BookingsService {
     quantity: number,
     ride: RideEntity,
   ) {
-    // Generate unique display ID and cryptographic QR token
-    const displayId = `MT${Date.now().toString().slice(-5)}`;
-    const qrToken   = uuidv4(); // opaque — no user data in QR
-
-    // eventDate MUST be the fair's actual event date, never "today" (booking
-    // day and event day are different whenever someone books in advance).
-    // This also feeds the partitioned tickets table's partition key (see
-    // migrations/PartitionTicketsByEventDate) — a wrong date here silently
-    // files the ticket under the wrong month's partition. `ride.fair` is
-    // loaded via leftJoinAndSelect at both call sites specifically so this
-    // is always available; if it's ever missing, fail loudly rather than
-    // quietly falling back to today's date (the bug being fixed).
     if (!ride.fair?.startDate) {
       throw new BadRequestException("This ride's fair has no event date set — cannot issue ticket.");
     }
     const eventDate = ride.fair.startDate;
+    const ticketRepo = em.getRepository(TicketEntity);
+    const savedIds: string[] = [];
 
-    const ticket = em.getRepository(TicketEntity).create({
-      displayId,
-      qrToken,
-      quantity,
-      pricePerPerson: ride.pricePerPerson,
-      totalAmount:   payment.amount,
-      paymentMethod: payment.method,
-      paymentStatus: PaymentStatus.PAID,
-      ticketStatus:  TicketStatus.VALID,
-      eventDate,
-      customer:      { id: userId } as UserEntity,
-      ride:          { id: ride.id } as RideEntity,
-      fair:          { id: ride.fair.id } as FairEntity,
-      payment,
-    });
-    const saved = await em.getRepository(TicketEntity).save(ticket);
+    for (let i = 0; i < quantity; i++) {
+      // FIX: displayId used to be `MT${Date.now().toString().slice(-5)}`
+      // computed once per booking — fine when only one row was ever
+      // created per purchase. Generating several rows in a tight loop can
+      // easily land in the same millisecond, which would produce the exact
+      // same displayId twice and fail on the column's unique constraint.
+      // Offsetting Date.now() by the loop index keeps the same format
+      // while guaranteeing every ticket in this batch gets a distinct value.
+      const displayId = `MT${(Date.now() + i).toString().slice(-5)}`;
+      const qrToken   = uuidv4(); // opaque — no user data in QR
+
+      const ticket = ticketRepo.create({
+        displayId,
+        qrToken,
+        quantity: 1, // each row now represents exactly one admission
+        pricePerPerson: ride.pricePerPerson,
+        totalAmount:    ride.pricePerPerson, // this ticket's own share, not the whole payment's total
+        paymentMethod:  payment.method,
+        paymentStatus:  PaymentStatus.PAID,
+        ticketStatus:   TicketStatus.VALID,
+        eventDate,
+        customer:      { id: userId } as UserEntity,
+        ride:          { id: ride.id } as RideEntity,
+        fair:          { id: ride.fair.id } as FairEntity,
+        payment,
+      });
+      const saved = await ticketRepo.save(ticket);
+      savedIds.push(saved.id);
+    }
 
     // FIX: this used to return the just-saved entity as-is, which only had
     // `{ id }` stubs for `customer`/`ride`/`fair` (exactly what was assigned
@@ -593,11 +606,16 @@ export class BookingsService {
     // Reload with the relations loaded and route through the same
     // `toTicketDto` every other ticket-reading endpoint uses, so this
     // response is never a special, differently-shaped case.
-    const full = await em.getRepository(TicketEntity).findOne({
-      where:     { id: saved.id },
+    const fullTickets = await ticketRepo.find({
+      where:     { id: In(savedIds) },
       relations: ["ride", "fair", "customer"],
     });
-    return toTicketDto(full!);
+    // .find() with an IN(...) clause doesn't preserve insertion order —
+    // re-sort to match savedIds so "ticket 1 of 5" stays stable across the
+    // API response, the confirmation screen, and the email.
+    const byId: Record<string, any> = {};
+    for (const t of fullTickets) byId[t.id] = t;
+    return savedIds.map((id) => toTicketDto(byId[id]));
   }
 }
 
