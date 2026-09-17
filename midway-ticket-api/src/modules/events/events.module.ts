@@ -13,7 +13,7 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger,
 } from "@nestjs/common";
 import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
-import { Repository, DataSource } from "typeorm";
+import { Repository, DataSource, In } from "typeorm";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 import { BullModule } from "@nestjs/bullmq";
@@ -279,21 +279,20 @@ export class EventsService {
       });
       await em.save(payment);
 
-      const ticket = await this.issueEventTicket(em, userId, payment, quantity, lockedEvent);
+      const tickets = await this.issueEventTicket(em, userId, payment, quantity, lockedEvent);
 
-      await this.emailQ.add("send-ticket", {
+      this.emailQ.add("send-ticket", {
         customerId: userId,
-        ticketId:   ticket.id,
-        displayId:  ticket.displayId,
+        ticketIds:  tickets.map((t) => t.id),
       }).catch(() => {/* email failure should not fail the booking */});
 
-      await this.notifications.enqueue({
+      this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
         recipientUserId: userId,
-        payload: { ticketId: ticket.id, displayId: ticket.displayId },
+        payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { ticket, paymentId: payment.id };
+      return { tickets, paymentId: payment.id };
     });
   }
 
@@ -345,24 +344,28 @@ export class EventsService {
       payment.razorpaySignature = razorpaySignature;
       await em.save(payment);
 
-      const ticket = await this.issueEventTicket(em, userId, payment, payment.quantity, event);
+      const tickets = await this.issueEventTicket(em, userId, payment, payment.quantity, event);
 
-      await this.emailQ.add("send-ticket", {
+      this.emailQ.add("send-ticket", {
         customerId: userId,
-        ticketId:   ticket.id,
-        displayId:  ticket.displayId,
+        ticketIds:  tickets.map((t) => t.id),
       }).catch(() => {/* non-critical */});
 
-      await this.notifications.enqueue({
+      this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
         recipientUserId: userId,
-        payload: { ticketId: ticket.id, displayId: ticket.displayId },
+        payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { ticket, paymentId: payment.id };
+      return { tickets, paymentId: payment.id };
     });
   }
 
+  /**
+   * Same fix as bookings.module.ts's issueTicket(): create one row (one QR)
+   * per person instead of a single row carrying a `quantity` field, so a
+   * group purchase gets one independently-scannable ticket per admission.
+   */
   private async issueEventTicket(
     em: any,
     userId: string,
@@ -370,30 +373,40 @@ export class EventsService {
     quantity: number,
     event: EventEntity,
   ) {
-    const displayId = `MT${Date.now().toString().slice(-5)}`;
-    const qrToken   = uuidv4();
+    const ticketRepo = em.getRepository(TicketEntity);
+    const savedIds: string[] = [];
 
-    const ticket = em.getRepository(TicketEntity).create({
-      displayId,
-      qrToken,
-      quantity,
-      pricePerPerson: event.pricePerTicket,
-      totalAmount:    payment.amount,
-      paymentMethod:  payment.method,
-      paymentStatus:  PaymentStatus.PAID,
-      ticketStatus:   TicketStatus.VALID,
-      eventDate:      event.eventDate,
-      customer:       { id: userId } as UserEntity,
-      event:          { id: event.id } as EventEntity,
-      payment,
-    });
-    const saved = await em.getRepository(TicketEntity).save(ticket);
+    for (let i = 0; i < quantity; i++) {
+      // Same collision fix as the ride flow — offset by loop index so a
+      // tight loop can't generate the same displayId twice.
+      const displayId = `MT${(Date.now() + i).toString().slice(-5)}`;
+      const qrToken   = uuidv4();
 
-    const full = await em.getRepository(TicketEntity).findOne({
-      where:     { id: saved.id },
+      const ticket = ticketRepo.create({
+        displayId,
+        qrToken,
+        quantity: 1,
+        pricePerPerson: event.pricePerTicket,
+        totalAmount:    event.pricePerTicket, // this ticket's own share, not the whole payment's total
+        paymentMethod:  payment.method,
+        paymentStatus:  PaymentStatus.PAID,
+        ticketStatus:   TicketStatus.VALID,
+        eventDate:      event.eventDate,
+        customer:       { id: userId } as UserEntity,
+        event:          { id: event.id } as EventEntity,
+        payment,
+      });
+      const saved = await ticketRepo.save(ticket);
+      savedIds.push(saved.id);
+    }
+
+    const fullTickets = await ticketRepo.find({
+      where:     { id: In(savedIds) },
       relations: ["event", "customer"],
     });
-    return toTicketDto(full!);
+    const byId: Record<string, any> = {};
+    for (const t of fullTickets) byId[t.id] = t;
+    return savedIds.map((id) => toTicketDto(byId[id]));
   }
 
   // ── Operator: issue a ticket without payment (QR/scanner testing) ────────
