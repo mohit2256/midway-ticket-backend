@@ -6,7 +6,7 @@
 import { Processor, WorkerHost } from "@nestjs/bullmq";
 import { Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { Repository } from "typeorm";
+import { Repository, In } from "typeorm";
 import { Job } from "bullmq";
 import { ConfigService } from "@nestjs/config";
 import * as nodemailer from "nodemailer";
@@ -15,8 +15,8 @@ import { TicketEntity } from "../entities";
 
 export interface SendTicketJob {
   customerId: string;
-  ticketId:   string;
-  displayId:  string;
+  /** One email per purchase, one QR per ticket — every ticket from that purchase goes in here, not just one. */
+  ticketIds: string[];
 }
 
 export interface SendVerificationEmailJob {
@@ -116,44 +116,90 @@ export class EmailProcessor extends WorkerHost {
     this.logger.log(`Password reset email sent → ${email}`);
   }
 
-  private async sendTicketEmail({ ticketId, displayId }: SendTicketJob) {
-    const ticket = await this.tickets.findOne({
-      where: { id: ticketId },
-      relations: ["customer", "ride", "fair"],
-      select: { qrToken: true, id: true, displayId: true, quantity: true, totalAmount: true, eventDate: true },
+  private async sendTicketEmail({ ticketIds }: SendTicketJob) {
+    // FIX: this used to load a single ticket with relations ["customer",
+    // "ride", "fair"] — no "event" relation at all. Any ticket booked
+    // through the Events flow (ride/fair both null, event set instead)
+    // would silently render "Your ticket for undefined" in the subject and
+    // body, since ticket.ride?.name was always undefined for those.
+    const tickets = await this.tickets.find({
+      where:     { id: In(ticketIds) },
+      relations: ["customer", "ride", "fair", "event"],
+      select: {
+        qrToken: true, id: true, displayId: true, quantity: true,
+        totalAmount: true, eventDate: true,
+      },
     });
 
-    if (!ticket) {
-      this.logger.error(`Ticket ${ticketId} not found for email`);
+    if (tickets.length === 0) {
+      this.logger.error(`None of tickets [${ticketIds.join(", ")}] found for email`);
       return;
     }
 
-    // Generate QR data URL
-    const qrDataUrl = await QRCode.toDataURL(ticket.qrToken, {
-      errorCorrectionLevel: "H",
-      margin: 2,
-      width: 300,
-    });
+    const customer = tickets[0].customer;
+    if (!customer?.email) {
+      this.logger.error(`Ticket batch [${ticketIds.join(", ")}] has no customer email`);
+      return;
+    }
 
-    const html = this.buildEmailHtml(ticket, qrDataUrl);
+    // One QR image per ticket, each with its own cid so it embeds
+    // correctly as a distinct inline image in the HTML below.
+    const withQr = await Promise.all(
+      tickets.map(async (ticket, i) => ({
+        ticket,
+        cid: `qrcode${i}`,
+        qrDataUrl: await QRCode.toDataURL(ticket.qrToken, {
+          errorCorrectionLevel: "H",
+          margin: 2,
+          width: 300,
+        }),
+      })),
+    );
+
+    const isEvent = !!tickets[0].event;
+    const subjectName = isEvent ? tickets[0].event?.name : tickets[0].ride?.name;
+    const html = this.buildEmailHtml(withQr, isEvent);
 
     await this.transporter.sendMail({
       from:    this.config.get("app.smtp.from", "tickets@midwayticket.in"),
-      to:      ticket.customer?.email,
-      subject: `Your ticket for ${ticket.ride?.name} — #${displayId}`,
+      to:      customer.email,
+      subject: tickets.length > 1
+        ? `Your ${tickets.length} tickets for ${subjectName}`
+        : `Your ticket for ${subjectName} — #${tickets[0].displayId}`,
       html,
-      attachments: [{
-        filename:    `midwayticket-${displayId}.png`,
+      attachments: withQr.map(({ ticket, cid, qrDataUrl }) => ({
+        filename:    `midwayticket-${ticket.displayId}.png`,
         path:        qrDataUrl,
         contentType: "image/png",
-        cid:         "qrcode",
-      }],
+        cid,
+      })),
     });
 
-    this.logger.log(`Ticket email sent for ${displayId} → ${ticket.customer?.email}`);
+    this.logger.log(`Ticket email sent for [${tickets.map((t) => t.displayId).join(", ")}] → ${customer.email}`);
   }
 
-  private buildEmailHtml(ticket: any, qrDataUrl: string): string {
+  private buildEmailHtml(
+    withQr: { ticket: any; cid: string; qrDataUrl: string }[],
+    isEvent: boolean,
+  ): string {
+    const first = withQr[0].ticket;
+    const customerName = first.customer?.name;
+    const venueLine = isEvent
+      ? `<div class="row"><span class="label">Event</span><span class="value">${first.event?.name}</span></div>
+         <div class="row"><span class="label">Venue</span><span class="value">${first.event?.venue}</span></div>`
+      : `<div class="row"><span class="label">Ride</span><span class="value">${first.ride?.name}</span></div>
+         <div class="row"><span class="label">Fair</span><span class="value">${first.fair?.name}</span></div>`;
+
+    const totalPaid = withQr.reduce((sum, { ticket }) => sum + Number(ticket.totalAmount), 0);
+
+    const qrBlocks = withQr.map(({ ticket, cid }, i) => `
+      <div class="qr-section" style="${i > 0 ? "margin-top:12px;" : ""}">
+        <img src="cid:${cid}" alt="QR Code" />
+        <div class="ticket-id">#${ticket.displayId}</div>
+        <div class="qr-label">${withQr.length > 1 ? `Ticket ${i + 1} of ${withQr.length} — ` : ""}Show this QR code at the gate</div>
+      </div>
+    `).join("");
+
     return `
 <!DOCTYPE html>
 <html>
@@ -181,24 +227,19 @@ export class EmailProcessor extends WorkerHost {
   <div class="card">
     <div class="header">
       <div class="brand">MIDWAYTICKET</div>
-      <div class="title">Your ticket is ready! 🎉</div>
+      <div class="title">${withQr.length > 1 ? `Your ${withQr.length} tickets are ready! 🎉` : "Your ticket is ready! 🎉"}</div>
     </div>
     <div class="body">
-      <p style="color:#64748B;font-size:14px;margin-top:0">Hi ${ticket.customer?.name},<br>Your booking is confirmed. Show the QR below at the ride entrance.</p>
-      <div class="row"><span class="label">Ride</span><span class="value">${ticket.ride?.name}</span></div>
-      <div class="row"><span class="label">Fair</span><span class="value">${ticket.fair?.name}</span></div>
-      <div class="row"><span class="label">Date</span><span class="value">${ticket.eventDate}</span></div>
-      <div class="row"><span class="label">Tickets</span><span class="value">${ticket.quantity}</span></div>
-      <div class="row"><span class="label">Amount Paid</span><span class="value">₹${ticket.totalAmount}</span></div>
-      <div class="qr-section">
-        <img src="cid:qrcode" alt="QR Code"/>
-        <div class="ticket-id">#${ticket.displayId}</div>
-        <div class="qr-label">Show this QR code at the ride entrance</div>
-      </div>
+      <p style="color:#64748B;font-size:14px;margin-top:0">Hi ${customerName},<br>Your booking is confirmed. ${withQr.length > 1 ? "Each person shows their own QR code at the gate — they scan independently." : "Show the QR below at the gate."}</p>
+      ${venueLine}
+      <div class="row"><span class="label">Date</span><span class="value">${first.eventDate}</span></div>
+      <div class="row"><span class="label">Tickets</span><span class="value">${withQr.length}</span></div>
+      <div class="row"><span class="label">Amount Paid</span><span class="value">₹${totalPaid}</span></div>
+      ${qrBlocks}
     </div>
     <div class="footer">
       MidwayTicket · support@midwayticket.in<br/>
-      This ticket is valid for one use only.
+      ${withQr.length > 1 ? "Each ticket is valid for one use only." : "This ticket is valid for one use only."}
     </div>
   </div>
 </body>
