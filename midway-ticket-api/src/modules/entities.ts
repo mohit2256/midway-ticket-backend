@@ -590,6 +590,11 @@ export enum ScanOutcome {
   INVALID      = "INVALID",
   EXPIRED      = "EXPIRED",
   PAYMENT_FAIL = "PAYMENT_FAIL",
+  // The ticket and ride/event assignment both check out, but the ride is
+  // Paused/Maintenance or its fair has ENDED (or the standalone event has
+  // ENDED) — a real, distinct front-of-gate scenario from "wrong ride",
+  // where the ticket just isn't valid ANYWHERE right now.
+  RIDE_CLOSED  = "RIDE_CLOSED",
 }
 
 @Entity("scan_logs")
