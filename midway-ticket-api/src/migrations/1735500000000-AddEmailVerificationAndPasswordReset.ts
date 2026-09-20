@@ -9,6 +9,7 @@ import { MigrationInterface, QueryRunner } from "typeorm";
 // temporarily on and already created some of this.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+
 export class AddEmailVerificationAndPasswordReset1735500000000 implements MigrationInterface {
   name = "AddEmailVerificationAndPasswordReset1735500000000";
 
