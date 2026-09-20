@@ -25,7 +25,8 @@ import { v4 as uuidv4 } from "uuid";
 import * as QRCode from "qrcode";
 import {
   TicketEntity, TicketStatus, PaymentStatus, PaymentMethod,
-  StaffEntity, ScanLogEntity, ScanOutcome, RideEntity, EventEntity, NotificationType,
+  StaffEntity, ScanLogEntity, ScanOutcome, RideEntity, EventEntity,
+  RideStatus, FairStatus, EventStatus, NotificationType,
 } from "../entities";
 import { IsString, IsUUID } from "class-validator";
 import { ApiProperty } from "@nestjs/swagger";
@@ -352,6 +353,21 @@ export class TicketsService {
         };
       }
 
+      // ── Ride/fair closed check ─────────────────────────────────────────
+      // Ticket + assignment both check out, but the ride itself isn't
+      // currently operating (Paused/Maintenance) or its fair has ENDED.
+      // Distinct from WRONG_RIDE: this ticket doesn't belong anywhere else
+      // either, it's just not a valid time to redeem it.
+      if (ticket.ride.status !== RideStatus.ACTIVE || ticket.fair.status === FairStatus.ENDED) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.RIDE_CLOSED, gate);
+        return {
+          outcome: ScanOutcome.RIDE_CLOSED,
+          message: ticket.fair.status === FairStatus.ENDED
+            ? "This fair has ended. Entry is closed."
+            : `${ticket.ride.name} is currently ${ticket.ride.status === RideStatus.MAINTENANCE ? "under maintenance" : "paused"}.`,
+        };
+      }
+
       // ── All checks passed — mark as used ────────────────────────────────
       const staffMember = await em.getRepository(StaffEntity).findOne({
         where: { id: staffId },
@@ -487,6 +503,17 @@ export class TicketsService {
             ? `This ticket is valid for ${ticket.event.name}, not your assigned event.`
             : "This ticket isn't valid for an event scan.",
           actualRideName: ticket.event?.name,
+        };
+      }
+
+      // ── Event closed check ────────────────────────────────────────────
+      if (ticket.event.status !== EventStatus.ACTIVE) {
+        await this.logScan(staffId, ticket.id, qrToken, ScanOutcome.RIDE_CLOSED, gate);
+        return {
+          outcome: ScanOutcome.RIDE_CLOSED,
+          message: ticket.event.status === EventStatus.ENDED
+            ? "This event has ended. Entry is closed."
+            : "This event isn't open for entry yet.",
         };
       }
 
