@@ -10,7 +10,7 @@
 import "dotenv/config";
 import { DataSource } from "typeorm";
 import * as path from "path";
-
+ 
 export default new DataSource({
   type: "postgres",
 
