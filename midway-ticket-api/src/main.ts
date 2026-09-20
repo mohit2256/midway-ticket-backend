@@ -21,7 +21,7 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("🔥 UNCAUGHT EXCEPTION during boot:", err);
-});
+}); 
 
 /**
  * Run pending TypeORM migrations before the Nest app even boots.
