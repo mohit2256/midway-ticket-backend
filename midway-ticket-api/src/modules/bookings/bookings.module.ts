@@ -1,4 +1,3 @@
-import { EmailProcessor } from "./email.processor";
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOOKINGS MODULE
 // Flow: Customer selects ride → CreateBooking → Razorpay order created
@@ -10,8 +9,6 @@ import {
 } from "@nestjs/common";
 import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
 import { Repository, DataSource, In } from "typeorm";
-import { InjectQueue } from "@nestjs/bullmq";
-import { Queue } from "bullmq";
 import { ConfigService } from "@nestjs/config";
 import Razorpay from "razorpay";
 import * as crypto from "crypto";
@@ -29,7 +26,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from "@nestjs/swagger";
 import { Request } from "express";
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { BullModule } from "@nestjs/bullmq";
+import { EmailModule } from "../email/email.module";
 
 import {
   TicketEntity, PaymentEntity, RideEntity, FairEntity, OperatorEntity,
@@ -39,6 +36,7 @@ import { JwtAuthGuard, CurrentUser, Roles, RolesGuard } from "../../common/guard
 import { UserRole } from "../entities";
 import { NotificationsService } from "../notifications/notifications.module";
 import { NotificationsModule } from "../notifications/notifications.module";
+import { TicketEmailService } from "../email/ticket-email.service";
 import { toTicketDto } from "../tickets/tickets.module";
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
@@ -103,7 +101,7 @@ export class BookingsService {
     @InjectRepository(UserEntity)    private users:    Repository<UserEntity>,
     @InjectRepository(OperatorEntity) private operators: Repository<OperatorEntity>,
     @InjectDataSource()              private db:       DataSource,
-    @InjectQueue("email")            private emailQ:   Queue,
+    private readonly ticketEmail:    TicketEmailService,
     private readonly config:         ConfigService,
     private readonly notifications:  NotificationsService,
     @Inject(CACHE_MANAGER)           private cache:    Cache,
@@ -325,14 +323,13 @@ export class BookingsService {
 
       const tickets = await this.issueTicket(em, userId, payment, quantity, lockedRide);
 
-      // FIX: was a single { ticketId, displayId } — now every ticket from
-      // this purchase goes in one email/job so the customer gets one email
-      // with all N QR codes, not N separate emails (or, as before, only
-      // the first/only ticket's QR at all).
-      this.emailQ.add("send-ticket", {
-        customerId: userId,
-        ticketIds:  tickets.map((t) => t.id),
-      }).catch(() => {/* email failure should not fail the booking */});
+      // FIX: previously enqueued onto a Redis-backed BullMQ queue that has
+      // been unreachable in production, so this always silently failed —
+      // the ticket issuance still "succeeded" from the caller's point of
+      // view, but no email ever went out. Now sent directly (no Redis
+      // involved) and its real outcome is reported back as emailSent,
+      // instead of the frontend unconditionally claiming success.
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
 
       this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
@@ -340,7 +337,7 @@ export class BookingsService {
         payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { tickets, paymentId: payment.id };
+      return { tickets, paymentId: payment.id, emailSent };
     });
   }
 
@@ -468,15 +465,14 @@ export class BookingsService {
 
       const tickets = await this.issueTicket(em, userId, payment, payment.quantity, ride);
 
-      // Queue confirmation email (non-blocking) — one email, all N QR codes.
-      this.emailQ.add("send-ticket", {
-        customerId: userId,
-        ticketIds:  tickets.map((t) => t.id),
-      }).catch(() => {/* email failure should not fail the booking */});
+      // Sent directly (no Redis/queue involved) — see the free-ticket path
+      // above for why. Bounded to a few seconds so a slow SMTP server can
+      // never hang a real, already-paid booking's response either.
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
 
-      // In-app + future push/SMS notification — also non-blocking, also
-      // outside this DB transaction's concern. Eventual consistency: the
-      // customer sees "Ticket Issued" pop up a moment after the response.
+      // In-app + future push/SMS notification — non-blocking, outside this
+      // DB transaction's concern. Eventual consistency: the customer sees
+      // "Ticket Issued" pop up a moment after the response.
       this.notifications.enqueue({
         type:             NotificationType.TICKET_ISSUED,
         recipientUserId:  userId,
@@ -487,7 +483,7 @@ export class BookingsService {
         },
       });
 
-      return { tickets, paymentId: payment.id };
+      return { tickets, paymentId: payment.id, emailSent };
     });
   }
 
@@ -676,11 +672,11 @@ export class BookingsController {
 @Module({
   imports: [
     TypeOrmModule.forFeature([TicketEntity, PaymentEntity, RideEntity, FairEntity, UserEntity, OperatorEntity]),
-    BullModule.registerQueue({ name: "email" }),
     NotificationsModule,
+    EmailModule,
   ],
   controllers: [BookingsController],
-  providers:   [BookingsService, EmailProcessor],
+  providers:   [BookingsService],
   exports:     [BookingsService],
 })
 export class BookingsModule {}
