@@ -14,9 +14,6 @@ import {
 } from "@nestjs/common";
 import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
 import { Repository, DataSource, In } from "typeorm";
-import { InjectQueue } from "@nestjs/bullmq";
-import { Queue } from "bullmq";
-import { BullModule } from "@nestjs/bullmq";
 import { ConfigService } from "@nestjs/config";
 import Razorpay from "razorpay";
 import * as crypto from "crypto";
@@ -41,6 +38,8 @@ import {
 import { JwtAuthGuard, RolesGuard, Roles, CurrentUser } from "../../common/guards/auth.guards";
 import { NotificationsService } from "../notifications/notifications.module";
 import { NotificationsModule } from "../notifications/notifications.module";
+import { TicketEmailService } from "../email/ticket-email.service";
+import { EmailModule } from "../email/email.module";
 import { toTicketDto } from "../tickets/tickets.module";
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
@@ -114,7 +113,7 @@ export class EventsService {
     @InjectRepository(PaymentEntity)  private payments:  Repository<PaymentEntity>,
     @InjectRepository(TicketEntity)   private tickets:   Repository<TicketEntity>,
     @InjectDataSource()               private db:        DataSource,
-    @InjectQueue("email")             private emailQ:    Queue,
+    private readonly ticketEmail:      TicketEmailService,
     private readonly config:          ConfigService,
     private readonly notifications:   NotificationsService,
   ) {
@@ -281,10 +280,10 @@ export class EventsService {
 
       const tickets = await this.issueEventTicket(em, userId, payment, quantity, lockedEvent);
 
-      this.emailQ.add("send-ticket", {
-        customerId: userId,
-        ticketIds:  tickets.map((t) => t.id),
-      }).catch(() => {/* email failure should not fail the booking */});
+      // Sent directly (no Redis/queue involved) — see bookings.module.ts's
+      // ticketEmail usage for the full reasoning; the "email" BullMQ queue
+      // this used to go through has been unreachable in production.
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
 
       this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
@@ -292,7 +291,7 @@ export class EventsService {
         payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { tickets, paymentId: payment.id };
+      return { tickets, paymentId: payment.id, emailSent };
     });
   }
 
@@ -346,10 +345,7 @@ export class EventsService {
 
       const tickets = await this.issueEventTicket(em, userId, payment, payment.quantity, event);
 
-      this.emailQ.add("send-ticket", {
-        customerId: userId,
-        ticketIds:  tickets.map((t) => t.id),
-      }).catch(() => {/* non-critical */});
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
 
       this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
@@ -357,7 +353,7 @@ export class EventsService {
         payload: { ticketId: tickets[0].id, displayId: tickets[0].displayId, count: tickets.length },
       });
 
-      return { tickets, paymentId: payment.id };
+      return { tickets, paymentId: payment.id, emailSent };
     });
   }
 
@@ -523,8 +519,8 @@ export class EventsController {
 @Module({
   imports: [
     TypeOrmModule.forFeature([EventEntity, OperatorEntity, UserEntity, PaymentEntity, TicketEntity]),
-    BullModule.registerQueue({ name: "email" }),
     NotificationsModule,
+    EmailModule,
   ],
   controllers: [EventsController],
   providers:   [EventsService],
