@@ -51,8 +51,7 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { JwtService } from "@nestjs/jwt";
 import { ConfigService } from "@nestjs/config";
-import { InjectQueue } from "@nestjs/bullmq";
-import { Queue } from "bullmq";
+import { TicketEmailService } from "../email/ticket-email.service";
 import * as bcrypt from "bcrypt";
 import * as crypto from "crypto";
 import { UserEntity, StaffEntity, OperatorEntity } from "../entities";
@@ -75,7 +74,7 @@ export class AuthService {
     @InjectRepository(UserEntity)     private readonly users:     Repository<UserEntity>,
     @InjectRepository(StaffEntity)    private readonly staff:     Repository<StaffEntity>,
     @InjectRepository(OperatorEntity) private readonly operators: Repository<OperatorEntity>,
-    @InjectQueue("email")             private readonly emailQ:    Queue,
+    private readonly ticketEmail:      TicketEmailService,
     private readonly jwtService: JwtService,
     private readonly config:     ConfigService,
   ) {}
@@ -139,9 +138,12 @@ export class AuthService {
     await this.users.save(user);
 
     const verifyUrl = `${this.config.get("app.frontendUrl")}/verify-email?token=${token}`;
-    await this.emailQ.add("send-verification-email", {
-      email: user.email, name: user.name, verifyUrl,
-    }).catch((err) => this.logger.error("Failed to queue verification email", err));
+    // FIX: was queued through the same Redis-backed BullMQ "email" queue as
+    // ticket emails — unreachable in production, so verification emails
+    // were silently never sent either. TicketEmailService sends directly
+    // and never throws (bounded internally), so this still can't hang or
+    // fail signup even on a bad SMTP day.
+    await this.ticketEmail.sendVerificationEmail({ email: user.email, name: user.name, verifyUrl });
   }
 
   async verifyEmail(dto: VerifyEmailDto) {
@@ -193,9 +195,7 @@ export class AuthService {
     await this.users.save(user);
 
     const resetUrl = `${this.config.get("app.frontendUrl")}/reset-password?token=${token}`;
-    await this.emailQ.add("send-password-reset-email", {
-      email: user.email, name: user.name, resetUrl,
-    }).catch((err) => this.logger.error("Failed to queue password reset email", err));
+    await this.ticketEmail.sendPasswordResetEmail({ email: user.email, name: user.name, resetUrl });
 
     return genericResponse;
   }
@@ -417,14 +417,14 @@ import { Module } from "@nestjs/common";
 import { PassportModule } from "@nestjs/passport";
 import { JwtModule } from "@nestjs/jwt";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { BullModule } from "@nestjs/bullmq";
+import { EmailModule } from "../email/email.module";
 import { JwtStrategy } from "../../common/guards/auth.guards";
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([UserEntity, StaffEntity, OperatorEntity]),
     PassportModule.register({ defaultStrategy: "jwt" }),
-    BullModule.registerQueue({ name: "email" }),
+    EmailModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (cfg: ConfigService) => ({
