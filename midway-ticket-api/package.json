@@ -13,7 +13,7 @@
     "migration:run": "typeorm migration:run -d dist/config/typeorm-cli.datasource.js",
     "migration:revert": "typeorm migration:revert -d dist/config/typeorm-cli.datasource.js"
   },
-  "dependencies": {
+  "dependencies": { 
     "@nestjs/bullmq": "^10.1.1",
     "@nestjs/cache-manager": "^2.2.1",
     "@nestjs/common": "^10.3.0",
