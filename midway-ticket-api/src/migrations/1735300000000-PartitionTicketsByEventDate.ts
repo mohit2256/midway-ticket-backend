@@ -15,6 +15,7 @@ import { MigrationInterface, QueryRunner } from "typeorm";
 //   considered and rejected: fair count grows unboundedly and unpredictably
 //   (every new event = a new partition to pre-create), whereas months are
 //   finite and easy to pre-provision on a schedule.
+
 //
 // IMPORTANT TRADE-OFFS — read before running this against a real database:
 //
