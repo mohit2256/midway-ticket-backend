@@ -5,7 +5,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {
-  Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger,
+  Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger,
 } from "@nestjs/common";
 import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
 import { Repository, DataSource, In } from "typeorm";
@@ -50,6 +50,23 @@ export class CreateBookingDto {
   @ApiPropertyOptional() @IsEmail()  @IsString() customerEmail?: string;
 }
 
+/**
+ * Effortless/guest checkout — no account, no password, no prior sign-in.
+ * Only email + phone are collected. The backend finds-or-creates a
+ * lightweight customer account behind the scenes and books exactly the way
+ * an already-signed-in customer would (see bookGuest() below, which just
+ * calls the existing createBooking()) — nothing about ticket issuance,
+ * capacity locking, or payment handling is duplicated or bypassed.
+ */
+export class GuestBookingDto {
+  @ApiProperty() @IsUUID()  rideId:  string;
+  @ApiProperty() @IsInt() @Min(1) @Max(10) @Type(() => Number) quantity: number;
+  @ApiProperty() @IsEmail() email: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsEnum(PaymentMethod) paymentMethod?: PaymentMethod;
+}
+
 export class VerifyPaymentDto {
   @ApiProperty() @IsString() razorpayOrderId:    string;
   @ApiProperty() @IsString() razorpayPaymentId:  string;
@@ -82,6 +99,15 @@ import { Inject } from "@nestjs/common";
 import { CACHE_MANAGER } from "@nestjs/cache-manager";
 import { Cache } from "cache-manager";
 import { ConflictException } from "@nestjs/common";
+
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+// Same TTL as AuthService's magic-link tokens — this generates the exact
+// same kind of token, just triggered by a booking instead of an explicit
+// "email me a link" request.
+const MAGIC_LINK_TTL_MS = 30 * 60 * 1000;
 
 @Injectable()
 export class BookingsService {
@@ -185,7 +211,74 @@ export class BookingsService {
   }
 
   /**
-   * Atomically claim an idempotency key so only one concurrent request
+   * Guest checkout entry point — resolves (or creates) a lightweight
+   * customer account for the given email, then defers entirely to the
+   * exact same createBooking() an already-signed-in customer would hit.
+   * No capacity/payment/ticket logic is duplicated here.
+   */
+  async bookGuest(dto: GuestBookingDto, idempotencyKey?: string) {
+    const user = await this.resolveOrCreateGuestUser(dto.email, dto.name, dto.phone);
+    return this.createBooking(
+      user.id,
+      { rideId: dto.rideId, quantity: dto.quantity, paymentMethod: dto.paymentMethod },
+      idempotencyKey,
+    );
+  }
+
+  private async resolveOrCreateGuestUser(email: string, name?: string, phone?: string): Promise<UserEntity> {
+    const existing = await this.users.findOne({ where: { email } });
+    if (existing) {
+      // Never let a guest-checkout form silently pull an operator/staff
+      // email into the customer flow — same role-collision protection used
+      // for Google sign-in (see AuthService.findOrCreateGoogleUser).
+      if (existing.role !== UserRole.CUSTOMER) {
+        throw new ConflictException(
+          "This email is registered as a different type of account. Please use a different email to book as a guest.",
+        );
+      }
+      if (phone && !existing.phone) {
+        existing.phone = phone;
+        await this.users.save(existing);
+      }
+      return existing;
+    }
+
+    const created = this.users.create({
+      name:         name?.trim() || email.split("@")[0],
+      email,
+      phone,
+      role:         UserRole.CUSTOMER,
+      passwordHash: null as any,
+      // Typing an email into a checkout form doesn't prove ownership of it —
+      // that only happens once they actually click a magic link sent to it
+      // (see maybeGenerateMagicLink below, and AuthService.verifyMagicLink).
+      emailVerified: false,
+    });
+    return this.users.save(created);
+  }
+
+  /**
+   * If the ticket recipient hasn't proven email ownership yet, generates a
+   * one-time magic-link token (the exact same mechanism as
+   * AuthService.requestMagicLink) and returns the URL to embed directly in
+   * the ticket-confirmation email — satisfying "send a secure email
+   * containing a magic link" without sending a second, separate email.
+   * Returns undefined for an already-verified customer, so their ticket
+   * email doesn't carry a redundant CTA.
+   */
+  private async maybeGenerateMagicLink(em: any, userId: string): Promise<string | undefined> {
+    const userRepo = em.getRepository(UserEntity);
+    const user = await userRepo.findOne({ where: { id: userId } });
+    if (!user || user.emailVerified) return undefined;
+
+    const token = crypto.randomBytes(32).toString("hex");
+    user.emailVerificationTokenHash = sha256(token);
+    user.emailVerificationExpiresAt = new Date(Date.now() + MAGIC_LINK_TTL_MS);
+    await userRepo.save(user);
+
+    return `${this.config.get("app.frontendUrl")}/tickets/verify?token=${token}`;
+  }
+
    * proceeds to create the booking. Uses the underlying Redis client's
    * `SET key val NX PX <ms>` (available via cache-manager-redis-yet), which
    * is a single atomic operation — unlike a separate get+set.
@@ -329,7 +422,8 @@ export class BookingsService {
       // view, but no email ever went out. Now sent directly (no Redis
       // involved) and its real outcome is reported back as emailSent,
       // instead of the frontend unconditionally claiming success.
-      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
+      const magicLinkUrl = await this.maybeGenerateMagicLink(em, userId);
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id), magicLinkUrl);
 
       this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
@@ -634,6 +728,20 @@ export class BookingsController {
     @Headers("idempotency-key") idempotencyKey?: string,
   ) {
     return this.svc.createBooking(userId, dto, idempotencyKey);
+  }
+
+  @Post("guest")
+  // Deliberately no JwtAuthGuard — this IS the "no forced account/login"
+  // entry point. Identity is just an email address; resolveOrCreateGuestUser
+  // handles finding-or-creating the backing account server-side.
+  @ApiOperation({
+    summary: "Effortless guest checkout — no account or sign-in required, just email + phone.",
+  })
+  createGuest(
+    @Body() dto: GuestBookingDto,
+    @Headers("idempotency-key") idempotencyKey?: string,
+  ) {
+    return this.svc.bookGuest(dto, idempotencyKey);
   }
 
   @Post("verify")
