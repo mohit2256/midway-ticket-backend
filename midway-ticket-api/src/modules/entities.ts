@@ -52,8 +52,17 @@ export class UserEntity {
   @Column({ nullable: true })
   phone: string;
 
-  @Column({ select: false })         // never returned in queries
+  @Column({ select: false, nullable: true })
+  // Nullable: a guest-checkout or Google-only account never sets one.
+  // bcrypt.compare() against null/undefined is guarded explicitly wherever
+  // this is read (see AuthService.loginWithRole) — never assume it's set.
   passwordHash: string;
+
+  // Set once a Google sign-in has been linked to this account (see
+  // AuthService.googleAuth). Guest-checkout accounts have this null until
+  // the person actually signs in with Google using the same email.
+  @Column({ nullable: true, unique: true })
+  googleId: string;
 
   @Column({ type: "enum", enum: UserRole, default: UserRole.CUSTOMER })
   role: UserRole;
