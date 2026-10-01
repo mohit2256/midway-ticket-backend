@@ -22,7 +22,7 @@ import {
   IsString, IsDateString, IsInt, Min, Max, IsBoolean, IsEnum, IsEmail, IsOptional,
 } from "class-validator";
 import { Type } from "class-transformer";
-import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger"; 
 import {
   Controller, Get, Post, Patch, Body, Param, Query, UseGuards,
 } from "@nestjs/common";
