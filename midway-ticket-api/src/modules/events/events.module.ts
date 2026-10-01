@@ -10,7 +10,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {
-  Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger,
+  Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger,
 } from "@nestjs/common";
 import { InjectRepository, InjectDataSource } from "@nestjs/typeorm";
 import { Repository, DataSource, In } from "typeorm";
@@ -85,6 +85,17 @@ class BookEventDto {
   @ApiPropertyOptional() @IsOptional() @IsString() paymentMethod?: string;
 }
 
+/** Effortless/guest booking for a standalone Event — same reasoning as GuestBookingDto in bookings.module.ts. */
+class GuestBookEventDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional() @IsInt() @Min(1) @Max(10) @Type(() => Number)
+  quantity?: number;
+  @ApiProperty() @IsEmail() email: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() paymentMethod?: string;
+}
+
 class VerifyEventPaymentDto {
   @ApiProperty() @IsString() razorpayOrderId:   string;
   @ApiProperty() @IsString() razorpayPaymentId: string;
@@ -97,6 +108,11 @@ class IssueTestEventTicketDto {
   quantity?: number;
   @ApiPropertyOptional() @IsOptional() @IsEmail() customerEmail?: string;
 }
+
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+const MAGIC_LINK_TTL_MS = 30 * 60 * 1000;
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
@@ -241,6 +257,55 @@ export class EventsService {
     };
   }
 
+  /**
+   * Guest checkout for a standalone Event — same shape as
+   * BookingsService.bookGuest(): resolve-or-create the customer account,
+   * then defer entirely to the existing book() above.
+   */
+  async bookGuest(eventId: string, dto: GuestBookEventDto) {
+    const user = await this.resolveOrCreateGuestUser(dto.email, dto.name, dto.phone);
+    return this.book(eventId, user.id, { quantity: dto.quantity, paymentMethod: dto.paymentMethod });
+  }
+
+  private async resolveOrCreateGuestUser(email: string, name?: string, phone?: string): Promise<UserEntity> {
+    const existing = await this.users.findOne({ where: { email } });
+    if (existing) {
+      if (existing.role !== UserRole.CUSTOMER) {
+        throw new ConflictException(
+          "This email is registered as a different type of account. Please use a different email to book as a guest.",
+        );
+      }
+      if (phone && !existing.phone) {
+        existing.phone = phone;
+        await this.users.save(existing);
+      }
+      return existing;
+    }
+    const created = this.users.create({
+      name:          name?.trim() || email.split("@")[0],
+      email,
+      phone,
+      role:          UserRole.CUSTOMER,
+      passwordHash:  null as any,
+      emailVerified: false,
+    });
+    return this.users.save(created);
+  }
+
+  /** See BookingsService.maybeGenerateMagicLink — identical mechanism, reused here for Event tickets. */
+  private async maybeGenerateMagicLink(em: any, userId: string): Promise<string | undefined> {
+    const userRepo = em.getRepository(UserEntity);
+    const user = await userRepo.findOne({ where: { id: userId } });
+    if (!user || user.emailVerified) return undefined;
+
+    const token = crypto.randomBytes(32).toString("hex");
+    user.emailVerificationTokenHash = sha256(token);
+    user.emailVerificationExpiresAt = new Date(Date.now() + MAGIC_LINK_TTL_MS);
+    await userRepo.save(user);
+
+    return `${this.config.get("app.frontendUrl")}/tickets/verify?token=${token}`;
+  }
+
   private async issueFreeEventTicket(
     userId: string,
     event: EventEntity,
@@ -283,7 +348,8 @@ export class EventsService {
       // Sent directly (no Redis/queue involved) — see bookings.module.ts's
       // ticketEmail usage for the full reasoning; the "email" BullMQ queue
       // this used to go through has been unreachable in production.
-      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id));
+      const magicLinkUrl = await this.maybeGenerateMagicLink(em, userId);
+      const emailSent = await this.ticketEmail.sendTicketEmail(tickets.map((t) => t.id), magicLinkUrl);
 
       this.notifications.enqueue({
         type:            NotificationType.TICKET_ISSUED,
@@ -490,6 +556,16 @@ export class EventsController {
   })
   book(@Param("id") id: string, @Body() dto: BookEventDto, @CurrentUser("sub") userId: string) {
     return this.svc.book(id, userId, dto);
+  }
+
+  @Post(":id/book/guest")
+  // Deliberately no JwtAuthGuard — same "no forced account" entry point as
+  // POST /bookings/guest.
+  @ApiOperation({
+    summary: "Effortless guest checkout for this event — no account or sign-in required.",
+  })
+  bookGuest(@Param("id") id: string, @Body() dto: GuestBookEventDto) {
+    return this.svc.bookGuest(id, dto);
   }
 
   @Post(":id/verify")
