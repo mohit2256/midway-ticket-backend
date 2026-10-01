@@ -63,9 +63,9 @@ export class TicketEmailService {
    * actually went out. Never throws — a failed/slow email must never break
    * ticket issuance, which has already completed by the time this runs.
    */
-  async sendTicketEmail(ticketIds: string[]): Promise<boolean> {
+  async sendTicketEmail(ticketIds: string[], magicLinkUrl?: string): Promise<boolean> {
     try {
-      await this.withTimeout(this.doSendTicketEmail(ticketIds));
+      await this.withTimeout(this.doSendTicketEmail(ticketIds, magicLinkUrl));
       return true;
     } catch (err) {
       this.logger.error(`Ticket email failed for [${ticketIds.join(", ")}]: ${(err as Error).message}`);
@@ -89,6 +89,17 @@ export class TicketEmailService {
       return true;
     } catch (err) {
       this.logger.error(`Password reset email failed for ${params.email}: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /** "My Tickets" — a sign-in link that's also this email's proof of ownership. */
+  async sendMagicLinkEmail(params: { email: string; name: string; magicLinkUrl: string }): Promise<boolean> {
+    try {
+      await this.withTimeout(this.doSendMagicLinkEmail(params));
+      return true;
+    } catch (err) {
+      this.logger.error(`Magic link email failed for ${params.email}: ${(err as Error).message}`);
       return false;
     }
   }
@@ -155,7 +166,37 @@ export class TicketEmailService {
     this.logger.log(`Password reset email sent → ${email}`);
   }
 
-  private async doSendTicketEmail(ticketIds: string[]) {
+  private async doSendMagicLinkEmail({ email, name, magicLinkUrl }: { email: string; name: string; magicLinkUrl: string }) {
+    await this.transporter.sendMail({
+      from:    this.config.get("app.smtp.from", "tickets@midwayticket.in"),
+      to:      email,
+      subject: "View your MidwayTicket tickets",
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC;margin:0;padding:20px;">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">
+    <div style="background:linear-gradient(135deg,#0F172A,#1E293B);padding:24px;text-align:center;">
+      <div style="color:#38BDF8;font-size:12px;font-weight:700;letter-spacing:.1em;margin-bottom:4px;">MIDWAYTICKET</div>
+      <div style="color:#fff;font-size:22px;font-weight:700;">View your tickets</div>
+    </div>
+    <div style="padding:24px;">
+      <p style="color:#64748B;font-size:14px;">Hi ${name},<br>Tap below to securely sign in and see every ticket booked with this email address — no password needed.</p>
+      <div style="text-align:center;margin:24px 0;">
+        <a href="${magicLinkUrl}" style="display:inline-block;background:#0EA5E9;color:#fff;font-weight:600;font-size:14px;padding:12px 28px;border-radius:10px;text-decoration:none;">View My Tickets</a>
+      </div>
+      <p style="color:#94A3B8;font-size:12px;">This link expires in 30 minutes and can only be used once. If you didn't request this, you can safely ignore this email.</p>
+    </div>
+    <div style="padding:16px 24px;background:#F8FAFC;text-align:center;font-size:11px;color:#94A3B8;">MidwayTicket · support@midwayticket.in</div>
+  </div>
+</body>
+</html>`,
+    });
+    this.logger.log(`Magic link email sent → ${email}`);
+  }
+
+  private async doSendTicketEmail(ticketIds: string[], magicLinkUrl?: string) {
     const tickets = await this.tickets.find({
       where:     { id: In(ticketIds) },
       relations: ["customer", "ride", "fair", "event"],
@@ -190,7 +231,7 @@ export class TicketEmailService {
 
     const isEvent = !!tickets[0].event;
     const subjectName = isEvent ? tickets[0].event?.name : tickets[0].ride?.name;
-    const html = this.buildEmailHtml(withQr, isEvent);
+    const html = this.buildEmailHtml(withQr, isEvent, magicLinkUrl);
 
     await this.transporter.sendMail({
       from:    this.config.get("app.smtp.from", "tickets@midwayticket.in"),
@@ -213,6 +254,7 @@ export class TicketEmailService {
   private buildEmailHtml(
     withQr: { ticket: any; cid: string; qrDataUrl: string }[],
     isEvent: boolean,
+    magicLinkUrl?: string,
   ): string {
     const first = withQr[0].ticket;
     const customerName = first.customer?.name;
@@ -268,6 +310,11 @@ export class TicketEmailService {
       <div class="row"><span class="label">Tickets</span><span class="value">${withQr.length}</span></div>
       <div class="row"><span class="label">Amount Paid</span><span class="value">₹${totalPaid}</span></div>
       ${qrBlocks}
+      ${magicLinkUrl ? `
+      <div style="text-align:center;margin-top:20px;padding-top:20px;border-top:1px solid #F1F5F9;">
+        <p style="color:#64748B;font-size:13px;margin-bottom:10px;">Want to see this and any other tickets under this email, anytime?</p>
+        <a href="${magicLinkUrl}" style="display:inline-block;background:#F1F5F9;color:#0F172A;font-weight:600;font-size:13px;padding:10px 22px;border-radius:10px;text-decoration:none;">View All My Tickets</a>
+      </div>` : ""}
     </div>
     <div class="footer">
       MidwayTicket · support@midwayticket.in<br/>
