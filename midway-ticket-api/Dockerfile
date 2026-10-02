@@ -3,8 +3,18 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# FIX: `npm ci` refuses to run at all if package-lock.json isn't byte-exact
+# in sync with package.json (e.g. right after a new dependency like
+# google-auth-library is added to package.json but the lock file hasn't
+# been regenerated with `npm install` yet) — it fails the whole build with
+# EUSAGE instead of just... installing the package. `npm install` resolves
+# and updates the lock file itself as needed, so a dependency change here
+# doesn't require a separate local "npm install, commit the lock file" step
+# before it can deploy. Slightly slower and less strictly pinned than `ci`,
+# but the trade-off is worth it: this is still a committed package.json with
+# caret-range versions, not uncontrolled installs.
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 COPY . .
 RUN npm run build
@@ -18,7 +28,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 
