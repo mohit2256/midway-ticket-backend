@@ -20,7 +20,7 @@ export class RegisterOperatorDto {
   @ApiProperty() @IsString() @MinLength(8) password: string;
   @ApiProperty({ required: false }) @IsString() @IsOptional() phone?: string;
   @ApiProperty({ description: "Business / fair operator name, e.g. 'Grand City Mela Events'" })
-  @IsString() businessName: string;
+  @IsString() businessName: string; 
 }
 
 export class LoginDto {
