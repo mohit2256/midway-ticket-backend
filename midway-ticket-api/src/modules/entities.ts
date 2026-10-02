@@ -22,7 +22,7 @@ import {
  * A shared transformer applied to every decimal column fixes this once, at
  * the ORM boundary, instead of needing `Number(...)` coercion at every call
  * site across both codebases.
- */
+ */ 
 const decimalTransformer: ValueTransformer = {
   to: (value?: number | null) => value,
   from: (value?: string | null) => (value === null || value === undefined ? value : parseFloat(value)),
