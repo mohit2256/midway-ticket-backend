@@ -199,7 +199,14 @@ export class AuthService {
     if (!payload.email_verified) {
       throw new UnauthorizedException("Your Google email isn't verified. Please verify it with Google first.");
     }
-    return payload;
+    // FIX (TS2345): google-auth-library's own TokenPayload type declares
+    // `email?: string` (optional) even after the runtime check above proves
+    // it's present here — TypeScript's narrowing of an optional-chained
+    // property doesn't carry through to the function's inferred return
+    // type. Reconstructing a plain object with the fields actually needed
+    // downstream sidesteps the mismatch entirely, rather than fighting the
+    // library's types with a non-null assertion at every call site.
+    return { sub: payload.sub, email: payload.email, name: payload.name };
   }
 
   private async findOrCreateGoogleUser(
